@@ -1,0 +1,66 @@
+name: desk-arm
+
+services:
+  lerobot:
+    container_name: so101-hand
+    build:
+      context: .
+    image: desk-arm-lerobot:0.7.0-single-process
+    init: true
+    privileged: true
+    gpus: all
+    network_mode: host
+    shm_size: 1gb
+    working_dir: /workspace
+    command: ["sleep", "infinity"]
+    environment:
+      HOME: /workspace/data/home
+      HF_HOME: /workspace/data/huggingface
+      HF_LEROBOT_HOME: /workspace/data/lerobot-home
+      DISPLAY: ${DISPLAY:-:1}
+      XAUTHORITY: ${XAUTHORITY:-/run/user/1000/gdm/Xauthority}
+      XDG_RUNTIME_DIR: ${XDG_RUNTIME_DIR:-/run/user/1000}
+      WAYLAND_DISPLAY: ${WAYLAND_DISPLAY:-}
+      QT_X11_NO_MITSHM: "1"
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: all
+    volumes:
+      - type: bind
+        source: .
+        target: /workspace
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./data
+        target: /workspace/data
+        bind:
+          create_host_path: false
+      - type: bind
+        source: /dev
+        target: /dev
+        bind:
+          propagation: rshared
+          create_host_path: false
+      - type: bind
+        source: /run/udev
+        target: /run/udev
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: /tmp/.X11-unix
+        target: /tmp/.X11-unix
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${XDG_RUNTIME_DIR:-/run/user/1000}
+        target: ${XDG_RUNTIME_DIR:-/run/user/1000}
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${XAUTHORITY:-/run/user/1000/gdm/Xauthority}
+        target: ${XAUTHORITY:-/run/user/1000/gdm/Xauthority}
+        read_only: true
+        bind:
+          create_host_path: false
