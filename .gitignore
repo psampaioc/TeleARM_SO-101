@@ -20,7 +20,8 @@
 
 # Private agent instructions and internal collaboration notes
 /AGENTS.md
-/docs/plans/
+/docs/plans/*
+!/docs/plans/2026-11-10-1200-refactor-calibrated-hand-teleop-plan.md
 /docs/relatorio-auditoria-completa-2026-11-08.md
 /docs/guides/so101-video-course.md
 

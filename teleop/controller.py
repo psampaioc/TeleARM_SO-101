@@ -4,6 +4,7 @@ from collections import deque
 
 import numpy as np
 
+from teleop.camera_mapping import estimate_camera_xyz, hand_delta_to_base
 from teleop.kinematics import ENCODER_STEP_DEG, JOINT_NAMES, READBACK_TOLERANCE_DEG
 
 
@@ -52,9 +53,12 @@ class GestureDebouncer:
 class TeleopController:
     """Single-process hand-to-SO-101 state machine; LeRobot owns the serial bus."""
 
-    def __init__(self, adapter, kinematics, image_yz_map=None):
+    def __init__(self, adapter, kinematics, image_yz_map=None, metric_profile=None):
         self.adapter = adapter
         self.kinematics = kinematics
+        if metric_profile is not None and image_yz_map is not None:
+            raise ValueError("metric profile and legacy image map cannot be combined")
+        self.metric_profile = metric_profile
         self.image_yz_map = np.asarray(IMAGE_YZ_MAP if image_yz_map is None else image_yz_map, dtype=float)
         if self.image_yz_map.shape != (2, 2) or not np.all(np.isfinite(self.image_yz_map)):
             raise ValueError("image-to-base YZ map must be a finite 2x2 matrix")
@@ -90,6 +94,7 @@ class TeleopController:
         self.last_ik_result = None
         self.boundary_joints = ()
         self.saturated_axes = ()
+        self.current_hand_coords = None
 
     @property
     def palm_count(self):
@@ -128,6 +133,9 @@ class TeleopController:
     def _forward_pose(self, q):
         started = time.perf_counter_ns()
         pose = self.kinematics.forward_pose(q)
+        if self.metric_profile is not None:
+            pose = pose.copy()
+            pose[:3, 3] += pose[:3, :3] @ self.metric_profile.tool_offset_gripper_m
         self.latest_timings["fk"] = (time.perf_counter_ns() - started) / 1e6
         return pose
 
@@ -140,6 +148,7 @@ class TeleopController:
         self.pending_palms.clear()
         self.deadband_xyz = np.full(3, XYZ_DEADBAND_M)
         self.saturated_axes = ()
+        self.current_hand_coords = None
 
     def _fail(self, reason):
         self._clear_anchor()
@@ -271,6 +280,11 @@ class TeleopController:
         if len(self.pending_palms) < 2:
             return
         samples = np.asarray(self.pending_palms, dtype=float)
+        if self.metric_profile is not None:
+            camera_noise = np.std(samples, axis=0)
+            self.deadband_xyz = np.maximum(XYZ_DEADBAND_M,
+                                          3 * (np.abs(self.metric_profile.camera_delta_to_base) @ camera_noise))
+            return
         uv_noise = np.std(samples[:, :2], axis=0)
         yz_noise = np.abs(self.image_yz_map) @ uv_noise
         size = max(float(np.mean(samples[:, 2])), 1e-6)
@@ -285,7 +299,7 @@ class TeleopController:
                 self._start_calibration_recovery(q, now)
                 return
             self.arm_anchor = self._forward_pose(bounded)
-            self.hand_anchor = (float(sample.hx), float(sample.hy), float(sample.size))
+            self.hand_anchor = tuple(self.current_hand_coords)
             self._measure_activation_noise()
             self.last_seen = self.last_step = now
             self.requested_target = self.arm_anchor.copy()
@@ -306,7 +320,7 @@ class TeleopController:
             if clipped:
                 self._start_calibration_recovery(q, now)
                 return
-            self.hand_anchor = (float(sample.hx), float(sample.hy), float(sample.size))
+            self.hand_anchor = tuple(self.current_hand_coords)
             self.arm_anchor = self._forward_pose(bounded)
             self.requested_target = self.arm_anchor.copy()
             self.target_pose = self.arm_anchor.copy()
@@ -333,12 +347,19 @@ class TeleopController:
                 self._begin_ik_recovery(q, now)
                 return
 
-            du = float(sample.hx) - self.hand_anchor[0]
-            dv = float(sample.hy) - self.hand_anchor[1]
-            size_ratio = float(sample.size) / self.hand_anchor[2]
-            yz = self.image_yz_map @ np.array([du, dv])
-            depth = DEPTH_SCALE_M * (size_ratio - 1.0)
-            raw_delta = np.array([depth, yz[0], yz[1]], dtype=float)
+            if self.metric_profile is not None:
+                hand_delta = np.asarray(self.current_hand_coords) - self.hand_anchor
+                raw_delta = hand_delta_to_base(self.current_hand_coords, self.hand_anchor,
+                                               self.metric_profile)
+                self.hand_delta = tuple(float(value) for value in hand_delta)
+            else:
+                du = float(sample.hx) - self.hand_anchor[0]
+                dv = float(sample.hy) - self.hand_anchor[1]
+                size_ratio = float(sample.size) / self.hand_anchor[2]
+                yz = self.image_yz_map @ np.array([du, dv])
+                depth = DEPTH_SCALE_M * (size_ratio - 1.0)
+                raw_delta = np.array([depth, yz[0], yz[1]], dtype=float)
+                self.hand_delta = (du, dv, size_ratio - 1.0)
             axes = ("X", "Y", "Z")
             self.saturated_axes = tuple(
                 axis for axis, value in zip(axes, raw_delta)
@@ -349,7 +370,6 @@ class TeleopController:
             raw_target[:3, 3] += raw_delta
             target = self.arm_anchor.copy()
             target[:3, 3] += delta
-            self.hand_delta = (du, dv, size_ratio - 1.0)
             self.base_delta = tuple(float(value) for value in raw_delta)
             self.limited_delta = tuple(float(value) for value in delta)
             self.requested_target = raw_target
@@ -373,7 +393,10 @@ class TeleopController:
             dt = max(0.001, min(now - self.last_step, 0.05))
             max_step = min(math.degrees(JOINT_RATE_RAD_S * dt), MAX_STEP_DEG)
             started = time.perf_counter_ns()
-            result = self.kinematics.solve_position(q, target, max_step_deg=max_step)
+            ik_target = target.copy()
+            if self.metric_profile is not None:
+                ik_target[:3, 3] -= ik_target[:3, :3] @ self.metric_profile.tool_offset_gripper_m
+            result = self.kinematics.solve_position(q, ik_target, max_step_deg=max_step)
             self.latest_timings["ik"] = (time.perf_counter_ns() - started) / 1e6
             self.last_ik_result = result
             if not result.ok:
@@ -390,6 +413,12 @@ class TeleopController:
                     or np.any(q_result > self.kinematics.ik_upper + 1e-7)):
                 self._write_hold("IK returned an invalid or out-of-limit vector")
                 return
+            if self.metric_profile is not None:
+                before = float(np.linalg.norm(target[:3, 3] - self.measured_pose[:3, 3]))
+                after = float(np.linalg.norm(target[:3, 3] - self._forward_pose(q_result)[:3, 3]))
+                if after > 0.005 and before - after <= 1e-7:
+                    self._write_hold("IK made no tool-center progress")
+                    return
             action = {f"{name}.pos": float(value) for name, value in zip(JOINT_NAMES, q_result)}
             action.update(grip_action)
             self._send(action)
@@ -441,6 +470,7 @@ class TeleopController:
         raw_gesture = getattr(sample, "gesture", None) if sample is not None else None
         if raw_gesture is None:
             sample = None
+        self.current_hand_coords = None
         if self.state == "LIMIT" and self.limit_kind == "CALIBRATION":
             self._check_limit(now)
             return
@@ -450,6 +480,16 @@ class TeleopController:
             else:
                 self.feedback = "show PALM"
             return
+        if sample is not None:
+            try:
+                self.current_hand_coords = (estimate_camera_xyz(sample.landmarks, self.metric_profile,
+                                                                sample.palm_normal)
+                                            if self.metric_profile is not None else
+                                            np.array((sample.hx, sample.hy, sample.size), dtype=float))
+            except ValueError as exc:
+                self.feedback = f"INVALID hand geometry: {exc}"
+                sample = None
+                raw_gesture = None
         if self.state == "LIMIT":
             self._check_limit(now)
             return
@@ -468,7 +508,7 @@ class TeleopController:
         self.last_seen = now
         if self.state == "ACTIVE" and self.hand_missing:
             if raw_gesture == "PALM":
-                self.pending_palms.append((sample.hx, sample.hy, sample.size))
+                self.pending_palms.append(tuple(self.current_hand_coords))
             else:
                 self.pending_palms.clear()
             if self.debouncer.update(raw_gesture) == "PALM":
@@ -478,7 +518,7 @@ class TeleopController:
             return
 
         if raw_gesture == "PALM":
-            self.pending_palms.append((sample.hx, sample.hy, sample.size))
+            self.pending_palms.append(tuple(self.current_hand_coords))
         else:
             self.pending_palms.clear()
         stable = self.debouncer.update(raw_gesture)

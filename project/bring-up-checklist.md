@@ -1,6 +1,6 @@
 # SO-101 hand teleoperation bring-up
 
-Status: offline software preparation completed; physical commissioning has not been run in this execution. The follower calibration and MediaPipe model remain in `data/` and must not be edited or recalibrated as part of this checklist.
+Status: supervised trials reached ACTIVE and moved the arm, but full XYZ accuracy has not passed physical acceptance. The follower calibration and MediaPipe model remain in `data/` and must not be edited or recalibrated as part of this checklist.
 
 ## 1. Enter and identify the existing container
 
@@ -15,7 +15,7 @@ cd /workspace
 python -m teleop.hand_controller --camera /dev/video0
 ```
 
-Confirm the `hand_tracking` window shows `RAW PALM` and `STABLE PALM` after 3/3 frames, `RAW PINCH` for the crocodile pose, and `RAW FIST` immediately. `HAND ID` is handedness confidence, not gesture confidence. With no hand it must say `NO HAND`. This mode must not open `/dev/ttyACM0`, read calibration, connect LeRobot, or send servo commands. Press `q` to close it. Synthetic tests pass; these thresholds still need a live webcam check.
+Confirm the `hand_tracking` window shows PALM for an open hand, FIST for a closed hand, and HAND for intermediate poses. There is no discrete PINCH label: the 4–9–12 jaw angle is measured continuously after PALM activation. PALM needs 3/3 consecutive frames to activate live mode; FIST requests HOLD immediately. With no hand it must say `NO HAND`. Preview must not open `/dev/ttyACM0`, read calibration, connect LeRobot, or send servo commands. Press `q` to close it.
 
 Correct room lighting, camera framing, and the `/dev/video0` selection here. The current monocular mapping is relative; it does not estimate absolute depth.
 
@@ -41,7 +41,7 @@ python -m teleop.hand_controller \
   --live
 ```
 
-Read the on-screen `LIVE`, port, and robot ID before presenting a gesture. PALM must be 3/3 before the session becomes ACTIVE; that frame only anchors and must not move the arm. Use a small horizontal hand displacement. The initial workspace is only one robot axis and ±1 cm from the anchor; direction and scale still need physical verification. FIST or SPACE requests a one-time HOLD; `q` exits. HOLD is not a power cut, and disconnect may change torque, so keep supporting the arm.
+Read the on-screen `LIVE`, port, and robot ID before presenting a gesture. PALM must be 3/3 before the session becomes ACTIVE; that frame only anchors and must not move the arm. Start with a small horizontal hand displacement, then isolate vertical and depth movements. The current software permits XYZ and caps each axis at ±10 cm from the anchor; this is a command bound, not evidence of accurate physical travel. The operator confirmed horizontal direction, while vertical drift and depth/gripper response still require physical verification. FIST or SPACE requests a one-time HOLD; `q` exits. HOLD is not a power cut, and disconnect may change torque, so keep supporting the arm.
 
 The software keeps commands one encoder tick inside the calibration/URDF intersection. Readback within 1.1 ticks is projected to the boundary for IK; a larger excursion commands the inner boundary and waits for readback before rearming. This tolerance is offline-tested only. If serial/readback/write fails, assume the physical stop is unconfirmed and use the power cut-off.
 

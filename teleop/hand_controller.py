@@ -1,245 +1,18 @@
 import argparse
-from collections import defaultdict, deque
+import json
 import math
+import re
 import time
-from dataclasses import dataclass
 from pathlib import Path
 
-import numpy as np
-
 from teleop.controller import GestureDebouncer, PALM_FRAMES, TeleopController
+from teleop.camera_mapping import load_metric_profile
+from teleop.hand_geometry import (HandSample, FIST_RATIO_MAX, PALM_RATIO_MIN, _jaw_angle,
+    _palm_fist_ratio, _palm_normal, _sample, classify_gesture)
+from teleop.overlay import (TimingWindow, TIMING_KEYS, _draw_overlay,
+    _diagnostic_frame, _gesture_status, _hud_lines, _motor_lines, _terminal_status)
 from teleop.kinematics import SO101Kinematics
-from teleop.lerobot_adapter import JOINT_NAMES as MOTOR_NAMES, RobotAdapter
-
-
-@dataclass(frozen=True)
-class HandSample:
-    hx: float
-    hy: float
-    size: float
-    gesture: str | None
-    confidence: float
-    landmarks: np.ndarray | None = None
-    palm_ratio: float | None = None
-    jaw_angle_deg: float | None = None
-    palm_normal: np.ndarray | None = None
-
-
-FIST_RATIO_MAX = 0.7
-PALM_RATIO_MIN = 1.1
-TIMING_KEYS = ("camera", "convert", "infer", "feature", "read", "fk", "ik", "write", "controller", "display", "vision", "loop")
-
-
-class TimingWindow:
-    def __init__(self, warmup=30, window=300):
-        self.warmup = int(warmup)
-        self.values = defaultdict(lambda: deque(maxlen=int(window)))
-        self.frames = 0
-
-    def add(self, values):
-        self.frames += 1
-        if self.frames <= self.warmup:
-            return
-        for key, value in values.items():
-            value = float(value)
-            if math.isfinite(value):
-                self.values[key].append(value)
-
-    def percentile(self, key, percentile):
-        values = self.values[key]
-        return float(np.percentile(values, percentile)) if values else None
-
-    def line(self, keys, labels):
-        parts = []
-        for key, label in zip(keys, labels):
-            p50, p95 = self.percentile(key, 50), self.percentile(key, 95)
-            parts.append(f"{label} {p50:.1f}/{p95:.1f}" if p50 is not None else f"{label} --/--")
-        return "ms p50/p95 " + "  ".join(parts)
-
-
-def _fmt_vector(values):
-    if values is None:
-        return "—"
-    values = np.asarray(values, dtype=float)
-    if not np.all(np.isfinite(values)):
-        return "—"
-    return "[" + ",".join(f"{value:.2f}" for value in values) + "]"
-
-
-def _motor_lines(controller):
-    ids = getattr(getattr(controller, "adapter", None), "motor_ids", {})
-    if not ids:
-        return ["motors 1-3 read/cmd —", "motors 4-6 read/cmd —"]
-    measured = getattr(controller, "last_measured_q", None)
-    commanded = getattr(controller, "last_command_q", None)
-    read = list(measured) if measured is not None else [None] * 5
-    cmd = list(commanded) if commanded is not None else [None] * 5
-    read.append(getattr(controller, "last_measured_gripper", None))
-    cmd.append(getattr(controller, "last_command_gripper", None))
-
-    def value(number):
-        return f"{number:.2f}" if number is not None and math.isfinite(number) else "—"
-
-    parts = [f"M{ids[name]} {value(read[index])}/{value(cmd[index])}"
-             for index, name in enumerate(MOTOR_NAMES)]
-    return ["motors[°/%] read/cmd " + " | ".join(parts[:3]),
-            "motors[°/%] read/cmd " + " | ".join(parts[3:])]
-
-
-def _motor_feedback(controller, feedback):
-    ids = getattr(getattr(controller, "adapter", None), "motor_ids", {})
-    for name, id_ in ids.items():
-        feedback = feedback.replace(name, f"Motor {id_}")
-    return feedback
-
-
-def _hud_lines(mode, state, sample, controller, timings, count=0):
-    gesture = _gesture_status(sample.gesture if sample is not None else None, count, sample is not None)
-    feedback = _motor_feedback(controller, getattr(controller, "feedback", "")) if controller is not None else ""
-    ids = getattr(getattr(controller, "adapter", None), "motor_ids", {})
-    boundary = ",".join(f"Motor {ids.get(name, '?')}" for name in getattr(controller, "boundary_joints", ())) or "-"
-    caps = ",".join(getattr(controller, "saturated_axes", ())) or "-"
-    status = f" | {state}" if state else ""
-    lines = [f"{mode}{status} | joints {boundary} | axes {caps}"]
-
-    lines.extend(_motor_lines(controller))
-    last_read = getattr(controller, "last_read_at", None) if controller is not None else None
-    if controller is not None:
-        age = f"{time.monotonic() - last_read:.1f}s" if last_read is not None else "never"
-        freshness = "STALE" if last_read is None or time.monotonic() - last_read > 0.5 else "fresh"
-        control = "NOT FOLLOWING HAND" if state == "BLOCKED" or feedback.startswith("BLOCKED") else "following" if state == "ACTIVE" else "waiting"
-        lines.append(f"motor read {freshness} ({age}) | {control}")
-    anchor = getattr(controller, "arm_anchor", None) if controller is not None else None
-    measured_pose = getattr(controller, "measured_pose", None) if controller is not None else None
-    lines.append(f"XYZ[m] read {_fmt_vector(measured_pose[:3, 3] if measured_pose is not None else None)} | anchor {_fmt_vector(anchor[:3, 3] if anchor is not None else None)}")
-
-    ratio = getattr(sample, "palm_ratio", None) if sample is not None else None
-    jaw = getattr(sample, "jaw_angle_deg", None) if sample is not None else None
-    lines.append(f"hand {gesture} | d(2,12)/span(5,17) {ratio:.2f}" if ratio is not None else f"hand {gesture} | ratio —")
-    target = getattr(controller, "gripper_target", None) if controller is not None else None
-    jaw_text = f"{jaw:.0f}°" if jaw is not None else "—"
-    target_text = f"{target:.0f}" if target is not None else "—"
-    measured_grip = getattr(controller, "last_measured_gripper", None) if controller is not None else None
-    grip_read = f"{measured_grip:.0f}" if measured_grip is not None else "—"
-    lines.append(f"jaw ∠4-9-12 (opposite 4-12) {jaw_text} | grip read/target {grip_read}/{target_text}")
-
-    hand_delta = getattr(controller, "hand_delta", None) if controller is not None else None
-    base_delta = getattr(controller, "base_delta", None) if controller is not None else None
-    limited_delta = getattr(controller, "limited_delta", None) if controller is not None else None
-    lines.append(f"hand Δnorm {_fmt_vector(hand_delta)} | base Δ[m] raw {_fmt_vector(base_delta)} → cap {_fmt_vector(limited_delta)}")
-    normal = getattr(sample, "palm_normal", None) if sample is not None else None
-    lines.append(f"palm normal n(0,5,17) {_fmt_vector(normal)}")
-    requested = getattr(controller, "requested_target", None) if controller is not None else None
-    target = getattr(controller, "target_pose", None) if controller is not None else None
-    lines.append(f"XYZ[m] raw {_fmt_vector(requested[:3, 3] if requested is not None else None)} → target {_fmt_vector(target[:3, 3] if target is not None else None)}")
-    result = getattr(controller, "last_ik_result", None) if controller is not None else None
-    ik = f"{result.reason} {result.residual_m * 1000:.1f}mm" if result is not None and math.isfinite(result.residual_m) else (result.reason if result is not None else "—")
-    lines.append(f"feedback {feedback or '—'} | IK {ik}")
-    lines.append(timings.line(("camera", "convert", "infer", "feature", "vision"), ("cam", "cvt", "inf", "feat", "vis")))
-    lines.append(timings.line(("read", "fk", "ik", "write", "controller", "display", "loop"), ("read", "fk", "ik", "write", "ctrl", "ui", "loop")))
-    return lines
-
-
-def _draw_overlay(cv2, frame, sample, mode, state, controller, timings, count=0):
-    display = cv2.flip(cv2.resize(frame, (800, 600), interpolation=cv2.INTER_LINEAR), 1)
-    if sample is not None and sample.landmarks is not None:
-        for index, (x, y) in enumerate(sample.landmarks):
-            px, py = 799 - int(x * 800), int(y * 600)
-            cv2.circle(display, (px, py), 3, (40, 230, 40), -1)
-            cv2.putText(display, str(index), (px + 3, py - 3), cv2.FONT_HERSHEY_SIMPLEX, 0.28, (255, 255, 255), 1)
-    blocked = state == "BLOCKED" or getattr(controller, "feedback", "").startswith("BLOCKED")
-    color = (100, 100, 255) if blocked else (220, 255, 220)
-    lines = _hud_lines(mode, state, sample, controller, timings, count)
-    panel = display.copy()
-    cv2.rectangle(panel, (0, 0), (800, 285 if controller is not None else 245), (15, 15, 15), -1)
-    cv2.addWeighted(panel, 0.78, display, 0.22, 0, display)
-    for row, line in enumerate(lines):
-        cv2.putText(display, line, (10, 20 + row * 21), cv2.FONT_HERSHEY_SIMPLEX, 0.40, color, 1)
-    return display
-
-
-def _points3(landmarks):
-    if isinstance(landmarks, np.ndarray):
-        points = np.asarray(landmarks, dtype=float)
-    else:
-        points = np.asarray([[p.x, p.y, p.z] for p in landmarks], dtype=float)
-    if points.shape != (21, 3) or not np.all(np.isfinite(points)):
-        raise ValueError("hand landmarks must be a finite 21x3 array")
-    return points
-
-
-def _unit(vector):
-    norm = float(np.linalg.norm(vector))
-    if norm < 1e-8:
-        raise ValueError("degenerate hand geometry")
-    return vector / norm
-
-
-def _palm_fist_ratio(points):
-    points = _points3(points)
-    palm_width = float(np.linalg.norm(points[5] - points[17]))
-    if palm_width < 1e-6:
-        return None
-    return float(np.linalg.norm(points[2] - points[12]) / palm_width)
-
-
-def _jaw_angle(points):
-    points = _points3(points)
-    thumb_to_joint = float(np.linalg.norm(points[4] - points[9]))
-    joint_to_middle = float(np.linalg.norm(points[12] - points[9]))
-    thumb_to_middle = float(np.linalg.norm(points[4] - points[12]))
-    if thumb_to_joint < 1e-6 or joint_to_middle < 1e-6:
-        return None
-    cosine = (thumb_to_joint**2 + joint_to_middle**2 - thumb_to_middle**2) / (2 * thumb_to_joint * joint_to_middle)
-    cosine = float(np.clip(cosine, -1.0, 1.0))
-    return math.degrees(math.acos(cosine))
-
-
-def _palm_normal(points):
-    points = _points3(points)
-    normal = np.cross(points[5] - points[0], points[17] - points[0])
-    norm = float(np.linalg.norm(normal))
-    return normal / norm if norm >= 1e-8 else None
-
-
-def classify_gesture(world_landmarks):
-    points = _points3(world_landmarks)
-    palm_ratio = _palm_fist_ratio(points)
-    if palm_ratio is None:
-        return None
-    if palm_ratio <= FIST_RATIO_MAX:
-        return "FIST"
-    if palm_ratio >= PALM_RATIO_MIN:
-        return "PALM"
-    return "HAND"
-
-
-def _sample(result):
-    if not result.hand_landmarks or not result.hand_world_landmarks:
-        return None
-    image_points = np.asarray([[p.x, p.y] for p in result.hand_landmarks[0]], dtype=float)
-    if image_points.shape != (21, 2) or not np.all(np.isfinite(image_points)):
-        return None
-    center = image_points[0]
-    size = float(np.linalg.norm(image_points[0] - image_points[9]))
-    if not (0 <= center[0] <= 1 and 0 <= center[1] <= 1 and 0 < size <= 1):
-        return None
-    try:
-        world_points = _points3(result.hand_world_landmarks[0])
-        gesture = classify_gesture(world_points)
-        palm_ratio = _palm_fist_ratio(world_points)
-        if gesture is None or palm_ratio is None:
-            return None
-        jaw_angle = _jaw_angle(world_points)
-        palm_normal = _palm_normal(world_points)
-    except ValueError:
-        return None
-    confidence = 0.0
-    if result.handedness and result.handedness[0]:
-        confidence = float(result.handedness[0][0].score)
-    return HandSample(float(center[0]), float(center[1]), size, gesture, confidence,
-                      image_points, palm_ratio, jaw_angle, palm_normal)
-
+from teleop.lerobot_adapter import RobotAdapter
 
 def _save_snapshot(cv2, image, label, directory=Path("/workspace/data")):
     if not directory.is_dir():
@@ -256,40 +29,63 @@ def _save_snapshot(cv2, image, label, directory=Path("/workspace/data")):
     return path
 
 
-def _terminal_status(state, sample, count, controller, timings):
-    gesture = sample.gesture if sample is not None else "NO_HAND"
-    palm = f"{count}/3" if gesture == "PALM" else "-"
-    ratio = f"{sample.palm_ratio:.2f}" if sample is not None and sample.palm_ratio is not None else "-"
-    jaw = f"{sample.jaw_angle_deg:.0f}deg" if sample is not None and sample.jaw_angle_deg is not None else "-"
-    grip_cmd = getattr(controller, "gripper_target", None) if controller is not None else None
-    grip_read = getattr(controller, "last_measured_gripper", None) if controller is not None else None
-    grip = f"{grip_read:.0f}/{grip_cmd:.0f}" if grip_read is not None and grip_cmd is not None else "-/-"
-    motors = "\n".join(_motor_lines(controller))
-    feedback = _motor_feedback(controller, getattr(controller, "feedback", "-")) if controller is not None else "-"
-    delta = _fmt_vector(np.asarray(getattr(controller, "limited_delta", ()), dtype=float) * 1000) if controller is not None and getattr(controller, "limited_delta", None) is not None else "-"
-    ik_result = getattr(controller, "last_ik_result", None) if controller is not None else None
-    ik = f"{ik_result.reason}:{ik_result.residual_m * 1000:.1f}mm" if ik_result is not None and math.isfinite(ik_result.residual_m) else "-"
-    vision_p95 = timings.percentile("vision", 95)
-    loop_p95 = timings.percentile("loop", 95)
-    perf = f"vis/loop p95={vision_p95:.0f}/{loop_p95:.0f}ms" if vision_p95 is not None and loop_p95 is not None else "timing-warmup"
-    return (f"{state or 'PREVIEW'} raw={gesture} palm={palm} d2-12/span5-17={ratio} "
-            f"jaw4-9-12={jaw} grip read/target={grip}\n"
-            f"{motors} dXYZmm={delta} IK={ik} "
-            f"feedback={feedback} {perf}")
+def _load_sample_label(path):
+    label = json.loads(Path(path).read_text(encoding="utf-8"))
+    for key in ("session_id", "split", "hand_identity", "pose", "focus_zoom_mode", "measured_depth_m"):
+        if label.get(key) is None:
+            raise ValueError(f"sample label needs {key}")
+    if not isinstance(label["session_id"], str) or not re.fullmatch(r"[A-Za-z0-9_-]+", label["session_id"]):
+        raise ValueError("session_id must use letters, digits, _ or -")
+    if label["split"] not in ("fit", "held_out"):
+        raise ValueError("sample split must be fit or held_out")
+    for key in ("hand_identity", "pose", "focus_zoom_mode"):
+        if not isinstance(label[key], str) or not label[key].strip():
+            raise ValueError(f"{key} must be a nonempty label")
+    if not isinstance(label.get("use_for_metric"), bool):
+        raise ValueError("use_for_metric must explicitly be true or false")
+    for key in ("measured_depth_m", "measured_dx_m", "measured_dy_m", "uncertainty_m", "palm_to_grid_gap_m"):
+        value = label.get(key)
+        if value is not None and (isinstance(value, bool) or not isinstance(value, (int, float))
+                                  or not math.isfinite(value)):
+            raise ValueError(f"{key} must be finite metres or null")
+    if label["measured_depth_m"] <= 0:
+        raise ValueError("measured_depth_m must be positive metres")
+    return label
 
 
-def _gesture_status(gesture, count, detected):
-    if gesture == "PALM":
-        return f"PALM {count}/3"
-    return gesture or ("HAND" if detected else "NO HAND")
+def _write_sample_capture(directory, label, frames, camera, frame_shape):
+    directory = Path(directory)
+    directory.mkdir(parents=True, exist_ok=True)
+    if not directory.is_dir():
+        raise NotADirectoryError(directory)
+    path = directory / f"hand_{label['session_id']}_{time.time_ns()}.json"
+    if path.exists():
+        raise FileExistsError(path)
+    data = {"version": 1, "label": label, "camera": camera,
+            "width_px": frame_shape[1], "height_px": frame_shape[0], "frames": frames}
+    partial = path.with_suffix(".partial")
+    if not directory.is_dir() or partial.exists():
+        raise RuntimeError("sample destination missing or partial capture already exists")
+    partial.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+    if not directory.is_dir():
+        raise NotADirectoryError(directory)
+    partial.replace(path)
+    return path
 
 
-def _build_live_control(args):
+def _build_live_control(args, camera_mode=None):
     if not args.live:
         return None, None
+    profile_path = getattr(args, "metric_profile", None)
+    profile = None
+    if profile_path:
+        if camera_mode is None:
+            raise ValueError("metric profile requires the actual camera capture mode")
+        profile = load_metric_profile(profile_path, device=args.camera,
+                                      width_px=camera_mode[0], height_px=camera_mode[1])
     adapter = RobotAdapter(args.port, args.robot_id, live=True)
     kinematics = SO101Kinematics(calibration_path=adapter.calibration_file)
-    return adapter, TeleopController(adapter, kinematics)
+    return adapter, TeleopController(adapter, kinematics, metric_profile=profile)
 
 
 def run(args):
@@ -300,12 +96,18 @@ def run(args):
     if not model_path.is_file():
         raise FileNotFoundError(f"MediaPipe hand model not found: {model_path}")
     camera = None
+    sample_label = _load_sample_label(args.sample_label) if args.sample_label else None
+    if sample_label is not None and (args.live or args.sample_frames <= 0):
+        raise ValueError("hand sample capture requires preview and positive --sample-frames")
+    capture_remaining = 0
+    capture_records = []
     adapter = controller = None
     preview_gestures = GestureDebouncer()
     attempted_snapshots = set()
     last_video_timestamp = 0
     timing_window = TimingWindow()
     last_log = 0.0
+    last_state = None
     try:
         camera = cv2.VideoCapture(args.camera, cv2.CAP_V4L2)
         if not camera.isOpened():
@@ -322,10 +124,13 @@ def run(args):
             min_tracking_confidence=0.5,
         )
         with mp.tasks.vision.HandLandmarker.create_from_options(options) as landmarker:
-            adapter, controller = _build_live_control(args)
+            camera_mode = (int(camera.get(cv2.CAP_PROP_FRAME_WIDTH)),
+                           int(camera.get(cv2.CAP_PROP_FRAME_HEIGHT)))
+            adapter, controller = _build_live_control(args, camera_mode)
             if adapter is not None:
                 adapter.connect()
-                print(f"LIVE — robot={args.robot_id} serial={args.port}; MediaPipe CPU; SPACE holds, q exits")
+                method = "metric measured profile" if controller.metric_profile is not None else "legacy empirical XYZ"
+                print(f"LIVE — {method}; robot={args.robot_id} serial={args.port}; MediaPipe CPU; SPACE holds, q exits")
             else:
                 print("PREVIEW — serial OFF; MediaPipe CPU; q exits")
             cv2.namedWindow("hand_tracking", cv2.WINDOW_NORMAL)
@@ -376,32 +181,49 @@ def run(args):
                 display = _draw_overlay(cv2, frame, sample, mode, state, controller, timing_window, count)
                 cv2.imshow("hand_tracking", display)
                 key = cv2.waitKey(1) & 0xFF
+                if key == ord("s") and sample_label is not None and capture_remaining == 0:
+                    capture_remaining = args.sample_frames
+                    capture_records = []
+                    print(f"CAPTURE {capture_remaining} valid frames; hold hand still", flush=True)
+                if capture_remaining and sample is not None:
+                    capture_records.append({
+                        "timestamp_ns": time.time_ns(), "landmarks_normalized": sample.landmarks.tolist(),
+                        "palm_center_normalized": list(sample.palm_center), "palm_area_normalized": sample.palm_area,
+                        "gesture": sample.gesture, "jaw_angle_deg": sample.jaw_angle_deg,
+                        "palm_normal": sample.palm_normal.tolist() if sample.palm_normal is not None else None,
+                    })
+                    capture_remaining -= 1
+                    if capture_remaining == 0:
+                        path = _write_sample_capture(args.samples_dir, sample_label, capture_records, args.camera, frame.shape)
+                        print(f"CAPTURE saved {path}", flush=True)
                 stages["display"] = (time.perf_counter_ns() - started) / 1e6
-                stages["loop"] = (time.perf_counter_ns() - loop_start) / 1e6
-                timing_window.add(stages)
-                snapshot_labels = ["camera"]
-                if sample is not None:
+                snapshot_labels = ["camera"] if args.live else []
+                if args.live and sample is not None:
                     snapshot_labels.append("tracking")
-                if sample is not None and raw_gesture == "PALM" and count == PALM_FRAMES:
+                if args.live and sample is not None and raw_gesture == "PALM" and count == PALM_FRAMES:
                     snapshot_labels.append("palm")
-                if sample is not None and state == "ACTIVE" and sample.jaw_angle_deg is not None:
+                if args.live and sample is not None and state == "ACTIVE" and sample.jaw_angle_deg is not None:
                     if 10 <= sample.jaw_angle_deg <= 60:
                         snapshot_labels.append("jaw")
                     if sample.jaw_angle_deg <= 10:
                         snapshot_labels.append("jaw_closed")
-                if sample is not None and raw_gesture == "FIST":
+                if args.live and sample is not None and raw_gesture == "FIST":
                     snapshot_labels.append("fist")
+                diagnostic = _diagnostic_frame(cv2, display, sample) if snapshot_labels else None
                 for label in snapshot_labels:
                     if label not in attempted_snapshots:
                         attempted_snapshots.add(label)
-                        path = _save_snapshot(cv2, display, label)
+                        path = _save_snapshot(cv2, diagnostic, label)
                         if path is not None:
                             print(f"SNAPSHOT {path}", flush=True)
                         else:
                             print(f"SNAPSHOT unavailable: {label}", flush=True)
-                if now - last_log >= 1.0:
+                if state != last_state or now - last_log >= (0.2 if args.live else 1.0):
                     print(_terminal_status(state, sample, count, controller, timing_window), flush=True)
                     last_log = now
+                    last_state = state
+                stages["loop"] = (time.perf_counter_ns() - loop_start) / 1e6
+                timing_window.add(stages)
                 if key == ord(" ") and controller is not None:
                     controller.hold("SPACE")
                 elif key == ord("q"):
@@ -432,6 +254,10 @@ def main():
     parser.add_argument("--port", default="/dev/ttyACM0", help="follower serial port; used only with --live")
     parser.add_argument("--robot-id", default="teleArm_follower", help="LeRobot calibration ID; used only with --live")
     parser.add_argument("--live", action="store_true", help="connect to and command the follower; preview is the default")
+    parser.add_argument("--metric-profile", help="measured profile under data/; absent means legacy empirical XYZ")
+    parser.add_argument("--sample-label", help="preview-only JSON with independently measured depth and session labels")
+    parser.add_argument("--sample-frames", type=int, default=30)
+    parser.add_argument("--samples-dir", default="/workspace/data/hand_samples")
     try:
         run(parser.parse_args())
     except KeyboardInterrupt:

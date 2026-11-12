@@ -11,20 +11,20 @@
 
 ## Our current scope
 
-- Build one follower arm; do not build a leader arm.
+- Operate the assembled SO-101 follower; there is no leader arm.
 - Use the upstream follower kinematics and assembly.
-- Evaluate the 12 V follower motor option only after confirming exact C018 compatibility and total cost.
-- First bring-up by USB from a workstation.
-- Defer camera, Wi-Fi/Bluetooth, ESP32 bridge, OCR, SLM and ROS 2 integration until the stock follower moves safely.
+- Keep the installed motor/controller power configuration and the existing LeRobot calibration.
+- Control the follower by USB from the workstation.
+- Use the workstation webcam for experimental hand teleoperation after the stock follower moves safely. Defer the ESP32-mounted camera, Wi-Fi/Bluetooth bridge, OCR, SLM and ROS 2 integration.
 
 ## Explicit future features
 
 - Wireless workstation connection through ESP32 UART bridge.
-- Camera, potentially eye-in-hand, after mechanical and electrical validation.
+- ESP32 camera, potentially eye-in-hand, after mechanical and electrical validation.
 - Pre-programmed skills and validated natural-language intents.
 - OCR and object detection.
 
-## Acceptance gates
+## Initial assembly acceptance gates (historical)
 
 1. All six motors and the controller match the selected voltage and bus protocol.
 2. The upstream assembly passes visual and mechanical inspection.
