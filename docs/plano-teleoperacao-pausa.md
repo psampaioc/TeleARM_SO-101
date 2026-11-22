@@ -60,6 +60,64 @@ O operador imagina uma seta que flutua entre o polegar e o médio e continua a a
 2. **Candidato baseado na palma:** `c = (p5 + p9 + p13 + p17)/4`, `d_palma = normalize(c − p0)`. Pode ser mais estável ao dobrar os dedos, pois usa as suas bases e o pulso, mas aproxima o eixo longitudinal da palma, não garante que seja a bissetriz visual das pontas nem que a direção fique exatamente invariável. Os pontos também são estimados e podem oscilar ou ficar ocluídos. Outro candidato simples é `p9 − p0`.
 3. **Teste de comparação, sem escolha antecipada:** observar ambas as setas enquanto a palma fica imóvel e a garra humana abre e fecha; registar variação angular, perda de pontos, movimentos falsos e comportamento de frente/de lado. Para o controlo inicial, favorecer a mais estável entre as que correspondam à intenção do operador. Uma seta pode ser mostrada no espaço entre os dedos mas ter a sua direção calculada pela palma; indicar visualmente qual variante está a ser avaliada.
 
+#### Comparar A, B e C: plano de visualizacao
+
+O operador propôs ajustar uma reta aos pontos **5, 9, 13 e 17**, que não estão necessariamente alinhados, e desenhar uma normal no centro. A operação é um **ajuste ortogonal por componentes principais (PCA)**: a reta passa pelo centro dos quatro pontos e minimiza a soma dos quadrados das distâncias perpendiculares a ela. É diferente de forçar a reta a passar exatamente por todos os pontos. A decomposição por valores singulares, SVD, fornece o eixo de maior variação sem problemas especiais quando a reta é vertical ([NumPy: SVD](https://numpy.org/doc/stable/reference/generated/numpy.linalg.svd.html)).
+
+| Seta | Direção a comparar | Limitação |
+|---|---|---|
+| A | Pulso 0 → base do médio 9 | É longitudinal à palma; o pulso ou a base do dedo podem mover-se ou ficar ocultos. |
+| B | Normal em imagem à reta PCA das bases 5, 9, 13 e 17, desenhada no centro | A linha tem duas normais; usa-se o pulso 0 para escolher a que aponta para fora da palma. Se a mão estiver de lado, os pontos podem sobrepor-se ou a direção ficar ambígua. |
+| C | Bissetriz dos vetores 9→4 e 9→12 | Pode girar quando apenas um dedo abre ou fecha e pode desaparecer por oclusão. |
+
+A normal B é perpendicular **à reta 2D na imagem**; não é a normal 3D do plano da palma, nem garante que os dedos apontem sempre nessa direção. A mão pode ser curva ou os pontos ter ruído. Os valores de confiança e tolerância ficam por medir em preview; não converter uma hipótese matemática num comando de motor sem decisão e validação.
+
+**Onde inserir:** em `Brosnantest/hand_camera_teleop.py`, perto de `to_vec()` (`:132`), criar uma pequena função que receba landmarks e dimensões do frame e devolva centro/direção válida ou `None`. Dentro de `frame_display()`, depois de desenhar os pontos (`:222-234`), desenhar as setas A/B/C com rótulos e cores diferentes. Isto é uma proposta para implementação posterior. O script atual abre a serial e liga o braço durante o arranque, pelo que o trabalho de implementação deve primeiro providenciar uma opção de **preview sem ligação ao robô**; não executar o script atual como se fosse preview.
+
+Exemplo proposto para a seta **B**, com parâmetros ilustrativos a calibrar em imagens; não é código implementado:
+
+```python
+def palm_axis_b(landmarks, width, height, min_spread_px, min_axis_gap, min_wrist_px):
+    scale = np.array([width, height], dtype=float)
+    points = np.array([to_vec(landmarks[i]) * scale for i in (5, 9, 13, 17)])
+    wrist = to_vec(landmarks[0]) * scale
+    if not np.isfinite(points).all() or not np.isfinite(wrist).all():
+        return None
+
+    center = points.mean(axis=0)
+    _, values, vh = np.linalg.svd(points - center, full_matrices=False)
+    if values[0] <= min_spread_px or (values[0] - values[1]) / values[0] < min_axis_gap:
+        return None  # pontos demasiado juntos ou sem direção dominante
+
+    tangent = vh[0]
+    normal = np.array([-tangent[1], tangent[0]])
+    away_from_wrist = np.dot(normal, center - wrist)
+    if abs(away_from_wrist) < min_wrist_px:
+        return None  # o pulso não permite escolher o sentido com confiança
+    if away_from_wrist < 0:
+        normal = -normal
+    return center, normal
+```
+
+`min_spread_px`, `min_axis_gap` e `min_wrist_px` são nomes de parâmetros sem valores aprovados; `values` são valores singulares, não distâncias diretas de um ponto individual. Tratar também eventual `np.linalg.LinAlgError` como medição inválida. Se B for inválida, esconder ou indicar `B indisponível`, não apresentar uma seta antiga como atual. A orientação é calculada após multiplicar coordenadas normalizadas pela largura e altura, preservando o aspeto em píxeis.
+
+Exemplo visual a inserir no bloco de desenho, após o cálculo das três variantes:
+
+```python
+for label, candidate, color in [("A", arrow_a, (0, 255, 0)),
+                                ("B", arrow_b, (255, 0, 0)),
+                                ("C", arrow_c, (0, 255, 255))]:
+    if candidate is None:
+        continue
+    center, direction = candidate
+    start = tuple(np.rint(center).astype(int))
+    end = tuple(np.rint(center + 60 * direction).astype(int))
+    cv2.arrowedLine(image, start, end, color, 2, tipLength=0.2)
+    cv2.putText(image, label, end, cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+```
+
+`arrow_a`, `arrow_b` e `arrow_c` representam pares `(centro, direção unitária)` a calcular de acordo com a tabela; 60 píxeis é apenas comprimento de desenho. A e C também precisam de rejeitar normas demasiado pequenas e pontos inválidos; C deve rejeitar vetores quase opostos antes de normalizar a soma. Podem usar um centro gráfico comum para comparar orientação, desde que a origem matemática de cada vetor continue correta. Separar o desenho dos comandos: nenhuma seta A/B/C deve ser ligada à ação do robô na fase de comparação.
+
 Para qualquer vetor em imagem, converter primeiro os pontos normalizados para píxeis usando `u = x × largura` e `v = y × altura`; normalizar só após essa conversão para não distorcer os ângulos pela razão largura/altura. Validar normas e valores finitos antes da divisão. As coordenadas são estimativas sujeitas a oclusão e perspetiva. A [documentação MediaPipe](https://developers.google.com/edge/mediapipe/solutions/vision/hand_landmarker) distingue coordenadas de imagem dos landmarks 3D estimados centrados na mão; nenhum deles, por si só, mede a posição global da mão em relação à base do braço.
 
 #### Mapeamento para o espaco fixo
@@ -150,6 +208,8 @@ Antes da divisão, verificar que ambos os vetores têm norma acima de tolerânci
 **Arquivo futuro:** `Brosnantest/hand_camera_teleop.py`. Integrar a regra da secção “Sentido da mao e referenciais” depois da gestão de pausa de U1–U3; recolher a direção em cada frame aceite e aplicar apenas aos deslocamentos incrementais posteriores. Manter subida e descida independentes, invalidar direção ambígua com histerese e preservar a continuidade do alvo na inversão. Reancorar posição, direção e alvo na mesma transição já prevista de pausa/retomada. Não mudar o URDF nem a calibração e não aplicar uma rotação da orientação da mão à orientação da garra sem decisão separada.
 
 Comparar a bissetriz 4–9–12 com a direção da palma numa visualização sem motores e registar a escolha junto do operador antes de ligar qualquer variante ao movimento. A direção e a posição visual da seta são variáveis distintas. O mapeamento horizontal acima é uma primeira aproximação ao pedido, não demonstra seguimento real tridimensional da direção do dedo. A integração com depth e um vetor tridimensional fica fora deste plano até haver medição e escolha explícita de correspondência de eixos.
+
+Incluir a candidata B como alternativa principal pedida pelo operador e manter A/C para comparação; verificar frente, perfil, palma aberta, jacaré, dedos ocluídos, pulso perto da reta e pontos quase coincidentes. Escolher somente depois do preview e do acordo com o operador.
 
 A numeração dos 21 pontos já foi acrescentada ao desenho na janela para o operador poder identificar landmarks; é uma alteração visual e não implementa a adaptação dos eixos. Avaliar legibilidade e latência em futura visualização, sem considerar isso prova de controlo físico.
 
