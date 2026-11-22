@@ -2,7 +2,7 @@
 /records/
 /data/
 
-# Vendored source clone is kept locally at its pinned commit
+# Never commit a local reference checkout
 /upstream/SO-ARM100/
 
 # Local environments and generated output
@@ -20,15 +20,8 @@
 
 # Private agent instructions and internal collaboration notes
 /AGENTS.md
-/docs/plans/*
-!/docs/plans/2026-11-10-1200-refactor-calibrated-hand-teleop-plan.md
 /docs/relatorio-auditoria-completa-2026-11-08.md
 /docs/guides/so101-video-course.md
-
-# Superseded planning snapshots contain machine-specific paths and old commands
-/docs/plans/2026-11-07-*
-/docs/plans/2026-11-08-*
-/docs/plans/2026-11-09-0750-execution-baseline.md
 
 # Editor state and generated files
 .~lock.*#

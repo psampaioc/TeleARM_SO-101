@@ -8,9 +8,6 @@ records
 data
 assets
 docs
-project
-upstream
-teleop/ros2
 *.md
 *.vtt
 *.zip

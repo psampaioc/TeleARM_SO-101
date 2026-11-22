@@ -28,7 +28,6 @@ services:
       - type: bind
         source: .
         target: /workspace
-        read_only: true
         bind:
           create_host_path: false
       - type: bind
@@ -56,11 +55,5 @@ services:
       - type: bind
         source: ${XDG_RUNTIME_DIR:-/run/user/1000}
         target: ${XDG_RUNTIME_DIR:-/run/user/1000}
-        bind:
-          create_host_path: false
-      - type: bind
-        source: ${XAUTHORITY:-/run/user/1000/gdm/Xauthority}
-        target: ${XAUTHORITY:-/run/user/1000/gdm/Xauthority}
-        read_only: true
         bind:
           create_host_path: false

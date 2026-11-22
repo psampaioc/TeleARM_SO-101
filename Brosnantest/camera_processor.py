@@ -18,42 +18,31 @@ from dataclasses import dataclass, field
 
 from lerobot.configs.types import FeatureType, PipelineFeatureType, PolicyFeature
 from lerobot.processor import ProcessorStepRegistry, RobotAction, RobotActionProcessorStep
-from lerobot.teleoperators.phone.config_phone import PhoneOS
 
 
 @ProcessorStepRegistry.register("map_phone_action_to_robot_action")
 @dataclass
 class MapCameraHandActionToRobotAction(RobotActionProcessorStep):
     """
-    Maps calibrated phone pose actions to standardized robot action inputs.
+    Declare the camera-hand action schema expected by the LeRobot pipeline.
 
-    This processor step acts as a bridge between the phone teleoperator's output
-    and the robot's expected action format. It remaps the phone's 6-DoF pose
-    (position and rotation) to the robot's target end-effector pose, applying
-    necessary axis inversions and swaps. It also interprets platform-specific
-    button presses to generate a gripper command.
-
-    Attributes:
-        platform: The operating system of the phone (iOS or Android), used
-            to determine the correct button mappings for the gripper.
+    The action values pass through unchanged. Axis mapping is performed by
+    ``robot_process``; LeRobot processors handle the end-effector and joint steps.
+    The registry key and removal of ``phone.*`` features are retained for source
+    compatibility with the starting implementation.
     """
 
-    # TODO(Steven): Gripper vel could be output of phone_teleop directly
-    #platform: PhoneOS
     _enabled_prev: bool = field(default=False, init=False, repr=False)
 
     def action(self, action: RobotAction) -> RobotAction:
         """
-        Processes the phone action dictionary to create a robot action dictionary.
+        Return the input action unchanged.
 
         Args:
-            act: The input action dictionary from the phone teleoperator.
+            action: The camera-hand action dictionary.
 
         Returns:
-            A new action dictionary formatted for the robot controller.
-
-        Raises:
-            ValueError: If 'pos' or 'rot' keys are missing from the input action.
+            The same action dictionary without value or coordinate conversion.
         """
         return action
 
