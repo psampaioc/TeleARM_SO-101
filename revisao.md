@@ -99,3 +99,33 @@ Fonte: [`depth_estimate`](Brosnantest/hand_camera_teleop.py#L165).
 **Ideia para decisão:** medir a distância entre pontas ou um ângulo de dois vetores e mapear uma faixa de mão aberta/fechada para a faixa de posição calibrada da garra. A distância entre 4 e 12 é um lado de um triângulo, só uma hipotenusa se o triângulo for retângulo. Para o ângulo 4–9–12, os vetores partem do ponto 9 para 4 e para 12; o produto interno dá o cosseno do ângulo. Posições 2D dependem de perspetiva, escala e oclusão. Isto controla um alvo de posição; não comprova força de aperto.
 
 Fontes: [cálculo dos vetores](Brosnantest/hand_camera_teleop.py#L249), [remapeamento](Brosnantest/hand_camera_teleop.py#L303), [processador LeRobot v0.7.0](https://github.com/huggingface/lerobot/blob/v0.7.0/src/lerobot/robots/so_follower/robot_kinematic_processor.py).
+
+## 9. Rotação da mão, base, punho e pinça
+
+**Pergunta.** Se a direção da mão mudar, só o motor 1 se move? É possível controlar o motor 5 pela rotação da linha 5–17 e reancorar após retirar a mão? Vale mudar a pinça atual?
+
+**Resposta.** A IK atual encontra conjuntamente os alvos dos motores 1–5 para o referencial da garra; boa deteção não garante movimento isolado do motor 1 nem trajetória física correta. `target_wy` vem da orientação 2D do polegar e contribui à orientação da ferramenta, sem comandar motor 5 diretamente. O motor 6 tem um alvo de abertura calculado à parte pelo processador da garra, embora o pipeline também leia as juntas e entregue o resultado junto às outras ações.
+
+A orientação em imagem da linha 5→17 pode ser medida com `atan2(y17-y5, x17-x5)` em píxeis e comparada à referência para obter rotação relativa. Isso mede uma orientação projetada em 2D, não todas as rotações 3D nem necessariamente a rotação longitudinal desejada da garra. Pontos sobrepostos, mão de lado e oclusões tornam a medição ambígua. A retirada e reentrada da mão poderiam funcionar como embreagem: ao retomar, usar leitura atual do motor 5 e novo ângulo da mão como referências; pausa e reancoragem ainda não estão implementadas e não são comprovadamente seguras.
+
+Separar motor 5 requer solver ciente da junta controlada, preservação dos limites e verificação da orientação/posição alcançáveis; sobrescrever o resultado da IK pode invalidar a pose calculada. Não existe implementação direta já verificada. Como o operador relata que a pinça funciona bem, manter os pontos e filtro atuais é a hipótese inicial; observar primeiro quando o indicador 8 é ocluído antes de considerar médio 12 ou geometria 4–9–12. Corrigir perda da mão e repetição de incremento é assunto separado da escolha dos pontos.
+
+## 10. Eixo do motor 5 e controlo separado
+
+**Pergunta.** O motor 5 gira no seu próprio eixo, então por que os outros motores precisariam de se mover? A seta pode definir direção dos motores 1–4 e a linha 5–17 apenas a rotação do motor 5?
+
+**Resposta.** A explicação anterior omitiu a escala e o ponto específico: o eixo físico do M5 não se desloca simplesmente por o motor rodar. No URDF, a origem do referencial `gripper_frame_link` usado pela IK fica cerca de 7,90 mm radialmente afastada desse eixo e cerca de 98,13 mm ao longo dele. Com 1–4 fixos, rodar M5 move a origem modelada num círculo de raio 7,90 mm; para 90° a distância é 11,18 mm, para 180° 15,81 mm. Um ponto sobre o eixo não se desloca. As medidas descrevem o URDF e não confirmam onde está o centro físico da garra montada. Compensação dos outros motores só é necessária se pedirmos que o ponto excêntrico permaneça exatamente fixo.
+
+**Proposta do operador.** Usar A/B/C como direção desejada para o conjunto 1–4, e linha 5–17 como comando independente de rotação M5. É uma arquitetura a estudar, usando um ponto de controlo no eixo do punho e incluindo M5 na cinemática direta se for preciso estimar o ponto excêntrico. A seta 2D não fornece orientação 3D completa e exige definir correspondência de eixos e lidar com oclusão. A cinemática atual ainda não separa estas tarefas. O plano foi corrigido; não se implementou nem testou hardware.
+
+## 11. Movimento relativo à seta e ponto no eixo
+
+**Pedido.** Usar o ponto mais simples no eixo de M5 para o primeiro ensaio. Ancorar mão e garra no início; subida da mão deve subir a garra, rotação da mão orientar a garra, e o movimento da mão ao longo da seta deve gerar avanço/recuo. Movimento perpendicular não deve gerar avanço.
+
+**Análise.** Produto interno do deslocamento pela direção unitária dá a componente de avanço; a regra antiga apenas por sinal horizontal não fazia isso. Para preservar subida independente, a projeção deve ocorrer num plano adequado: usar diretamente a mesma coordenada de imagem para avanço e subida pode contar o movimento duas vezes. A seta e o movimento na imagem não revelam, por si, a orientação da câmara em relação à base do robô; a convenção básica e os sinais têm de ser definidos e testados. O frame `gripper_link` existente está no eixo de M5 e é o primeiro candidato simples, mas fica cerca de 98 mm antes do frame de controlo anterior. Nenhuma alteração no controlador nem teste físico foi feita.
+
+## 12. Seta B e rotação do motor 5
+
+**Pergunta e decisão.** A seta B e a linha 5–17 podem ser perpendiculares e rodar juntas; queremos orientar M1–M4 pela direção da mão e M5 pela rotação axial, escolhendo a solução mais simples.
+
+**Análise.** A perpendicular e a linha em 2D compartilham a mesma variação angular; dois cálculos com esses mesmos ângulos em imagem não distinguem rotação de direção e rotação axial. O MediaPipe já fornece `hand_world_landmarks` estimados no mesmo resultado, sem câmara de profundidade. Uma hipótese é usar o centro B 2D para posição, uma direção da palma calculada em 3D para M1–M4 e a rotação transversal relativa a essa direção para M5. A direção 3D não coincide automaticamente com a PCA 2D B; comparar e validar. Um teste com pontos 3D sintéticos separou mudança de direção e rotação axial; não constitui teste da precisão do MediaPipe ou do braço. A mudança permanece proposta no plano e não foi implementada no controlador.
