@@ -13,6 +13,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specif
 
+import copy
 import time
 
 from lerobot.model.kinematics import RobotKinematics
@@ -37,6 +38,39 @@ import threading
 import queue
 import numpy as np
 
+class FixedJointKinematics(RobotKinematics):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.fixed_targets = None
+        self.base_index = self.joint_names.index("shoulder_pan")
+        self.roll_index = self.joint_names.index("wrist_roll")
+        self.solver.mask_dof("shoulder_pan")
+        self.solver.mask_dof("wrist_roll")
+
+    def inverse_kinematics(self, current_joint_pos, desired_ee_pose, *args, **kwargs):
+        joints = np.array(current_joint_pos, dtype=float, copy=True)
+        if self.fixed_targets is not None:
+            joints[self.base_index], joints[self.roll_index] = self.fixed_targets
+        return super().inverse_kinematics(joints, desired_ee_pose, *args, **kwargs)
+
+def calibrated_fixed_bounds(bus):
+    bounds = {}
+    for name in ("shoulder_pan", "wrist_roll"):
+        motor = bus.motors[name]
+        cal = bus.calibration[name]
+        if cal.id != motor.id or cal.range_min >= cal.range_max:
+            raise ValueError(f"calibração inválida: {name}")
+        low = float(bus._normalize({motor.id: cal.range_min})[motor.id])
+        high = float(bus._normalize({motor.id: cal.range_max})[motor.id])
+        if not np.isfinite([low, high]).all() or low >= high:
+            raise ValueError(f"limites calibrados inválidos: {name}")
+        bounds[name] = (low, high)
+    return bounds
+
+def fixed_targets_in_bounds(targets, bounds):
+    return all(np.isfinite(value) and bounds[name][0] <= value <= bounds[name][1]
+               for name, value in zip(("shoulder_pan", "wrist_roll"), targets))
+
 FPS = 45
 
 # Initialize the robot and teleoperator
@@ -48,7 +82,7 @@ robot_config = SO101FollowerConfig(
 robot = SO101Follower(robot_config)
 
 # NOTE: It is highly recommended to use the urdf in the SO-ARM100 repo: https://github.com/TheRobotStudio/SO-ARM100/blob/main/Simulation/SO101/so101_new_calib.urdf
-kinematics_solver = RobotKinematics(
+kinematics_solver = FixedJointKinematics(
     urdf_path="/workspace/teleop/models/so101/so101_new_calib.urdf",
     target_frame_name="gripper_frame_link",
     joint_names=list(robot.bus.motors.keys()),
@@ -114,23 +148,61 @@ if not robot.is_connected:
     hands.close()
     raise RuntimeError("SO-101 follower did not connect")
 
+try:
+    fixed_bounds = calibrated_fixed_bounds(robot.bus)
+except Exception:
+    cap.release()
+    hands.close()
+    robot.disconnect()
+    raise
+
 print("Starting Brosnan hand teleoperation on SO-101. Press Esc to exit.", flush=True)
 
 frame_queue = queue.Queue(maxsize=5)
 stop_event = threading.Event()
+vision_error = threading.Event()
 action_queue = queue.Queue(maxsize=100)
+tracking_lock = threading.Lock()
+tracking_state = {"visible": False, "epoch": 0, "captured_at": 0.0, "status": "PAUSED"}
+MAX_FRAME_AGE = 0.5
 
 def frame_capture():
     while not stop_event.is_set():
         success, frame = cap.read()
         if success:
             if not frame_queue.full():
-                frame_queue.put(frame)
+                frame_queue.put((time.monotonic(), frame))
         else:
             print("Ignoring empty camera frame.")
 
 def to_vec(landmark):
     return np.array([landmark.x, landmark.y])
+
+def hand_geometry(landmarks, width, height):
+    points = np.array([[landmarks[i].x * width, landmarks[i].y * height]
+                       for i in (5, 9, 13, 17)], dtype=np.float32)
+    wrist = np.array([landmarks[0].x * width, landmarks[0].y * height])
+    if not np.isfinite(points).all() or not np.isfinite(wrist).all():
+        return None
+    span = points[-1] - points[0]
+    if np.linalg.norm(span) < 1.0:
+        return None
+    vx, vy, cx, cy = cv2.fitLine(points, cv2.DIST_L2, 0, 0.01, 0.01).flatten()
+    line = np.array([vx, vy])
+    if np.dot(line, span) < 0:
+        line = -line
+    center = np.array([cx, cy])
+    forward = np.array([-line[1], line[0]])
+    projection = np.dot(forward, center - wrist)
+    if abs(projection) < 1.0:
+        return None
+    if projection < 0:
+        forward = -forward
+    return (float(np.degrees(np.arctan2(forward[1], forward[0]))),
+            float(np.degrees(np.arctan2(span[1], span[0]))), center, forward)
+
+def angle_delta(angle, reference):
+    return (angle - reference + 180.0) % 360.0 - 180.0
 
 def angle_between_vectors(v1, v2):
     # Normalize the vectors
@@ -149,19 +221,6 @@ def angle_between_vectors(v1, v2):
     
     return angle_deg
 
-downvec =  np.array([0.0, 1.0])
-
-def angle_between_vectors2(v1, v2):
-    angle_deg = angle_between_vectors(v1, v2)
-
-    down_angle = np.dot(v2, downvec)
-    if (down_angle > 0.0):
-        angle_deg = np.abs(angle_deg)
-    else:
-        angle_deg = -np.abs(angle_deg)
-    
-    return angle_deg
-
 def depth_estimate(hand_landmarks):
     diff1 = to_vec(hand_landmarks[4]) - to_vec(hand_landmarks[3])
     diff2 = to_vec(hand_landmarks[3]) - to_vec(hand_landmarks[2])
@@ -176,155 +235,229 @@ def depth_estimate(hand_landmarks):
 
 
 def frame_display():
-    hand_depth = -10000.0
-    initial_hand_depth = -10000.0
-
-    hand_pos = np.array([-10000.0, -10000.0])
-    initial_hand_pos = np.array([-10000.0, -10000.0])
-
-    thumb = np.array([-10000.0, -10000.0])
-    initial_thumb = np.array([-10000.0, -10000.0])
-
-    gripper_angle = -10000.0
-    prev_gripper_angle = -10000.0
-
-    target_wy = -10000.0
+    filtered_pos = filtered_depth = filtered_grip = None
+    filter_epoch = None
     last_video_timestamp = 0
     while not stop_event.is_set():
-        if not frame_queue.empty():
-            frame = frame_queue.get()
-
-            image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            image.flags.writeable = False
-            timestamp_ms = time.monotonic_ns() // 1_000_000
-            timestamp_ms = max(timestamp_ms, last_video_timestamp + 1)
-            last_video_timestamp = timestamp_ms
-            results = hands.detect_for_video(
-                mp.Image(image_format=mp.ImageFormat.SRGB, data=image), timestamp_ms
-            )
-
-            image.flags.writeable = True
-            image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
-
-            if results.hand_landmarks:
-                for hand_landmarks in results.hand_landmarks:
-                    height, width = image.shape[:2]
-                    for connection in mp.tasks.vision.HandLandmarksConnections.HAND_CONNECTIONS:
-                        start = hand_landmarks[connection.start]
-                        end = hand_landmarks[connection.end]
-                        cv2.line(
-                            image,
-                            (int(start.x * width), int(start.y * height)),
-                            (int(end.x * width), int(end.y * height)),
-                            (0, 255, 0),
-                            2,
-                        )
-                    for index, landmark in enumerate(hand_landmarks):
-                        cv2.circle(
-                            image,
-                            (int(landmark.x * width), int(landmark.y * height)),
-                            3,
-                            (0, 255, 0),
-                            -1,
-                        )
-                        cv2.putText(
-                            image, str(index),
-                            (int(landmark.x * width) + 4, int(landmark.y * height) - 4),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 255), 1, cv2.LINE_AA,
-                        )
-
-                    # Estimate apparent hand scale from normalized image landmarks.
-                    if hand_depth == -10000.0:
-                        hand_depth = depth_estimate(hand_landmarks)
-                    else:
-                        hand_depth = 0.9*hand_depth + 0.1*depth_estimate(hand_landmarks)
-
-                    if initial_hand_depth == -10000.0:
-                        initial_hand_depth = hand_depth
-
-                    # Track the normalized image position of landmark 2.
-                    if hand_pos[0] == -10000.0:
-                        hand_pos = to_vec(hand_landmarks[2])
-                    else:
-                        hand_pos = 0.9*hand_pos + 0.1*to_vec(hand_landmarks[2])
-                    
-                    if initial_hand_pos[0] == -10000.0:
-                        initial_hand_pos = hand_pos
-
-                    # Compute gripper angle
-                    thumb = to_vec(hand_landmarks[4]) - to_vec(hand_landmarks[0])
-                    finger = to_vec(hand_landmarks[8]) - to_vec(hand_landmarks[0])
-
-                    if gripper_angle == -10000.0:
-                        gripper_angle = angle_between_vectors(thumb, finger)
-                    else:
-                        gripper_angle = 0.9*gripper_angle + 0.1*angle_between_vectors(thumb, finger)
-                    if prev_gripper_angle == -10000.0:
-                        prev_gripper_angle = gripper_angle
-
-                    # Estimate a 2D thumb-angle change for the wrist-y target.
-                    if initial_thumb[0] == -10000.0:
-                        initial_thumb = thumb
-
-                    if target_wy == -10000.0:
-                        target_wy = angle_between_vectors2(initial_thumb, thumb)
-                    else:
-                        target_wy = 0.9*target_wy + 0.1*angle_between_vectors2(initial_thumb, thumb)
-                    # Send Action
-                    if not action_queue.full():
-                        action = {
-                            "target_x": hand_pos[0] - initial_hand_pos[0],
-                            "target_y": hand_pos[1] - initial_hand_pos[1],
-                            "target_z": hand_depth - initial_hand_depth,
-                            "gripper_vel": gripper_angle - prev_gripper_angle,
-                            "target_wy": target_wy,
-                        }
-                        action_queue.put(action)
-                        prev_gripper_angle = gripper_angle
-                    
-            cv2.imshow('SO-101 Hand Tracking', image)
+        try:
+            captured_at, frame = frame_queue.get(timeout=0.05)
+        except queue.Empty:
             if cv2.waitKey(5) & 0xFF == 27:
                 stop_event.set()
+            continue
+
+        image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        image.flags.writeable = False
+        timestamp_ms = max(time.monotonic_ns() // 1_000_000, last_video_timestamp + 1)
+        last_video_timestamp = timestamp_ms
+        results = hands.detect_for_video(
+            mp.Image(image_format=mp.ImageFormat.SRGB, data=image), timestamp_ms
+        )
+        image.flags.writeable = True
+        image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
+        height, width = image.shape[:2]
+        landmarks = results.hand_landmarks[0] if results.hand_landmarks else None
+        geometry = hand_geometry(landmarks, width, height) if landmarks else None
+        valid = geometry is not None and 0 <= time.monotonic() - captured_at <= MAX_FRAME_AGE
+
+        if valid:
+            b_angle, roll_angle, center, forward = geometry
+            position = to_vec(landmarks[2])
+            depth = depth_estimate(landmarks)
+            thumb = to_vec(landmarks[4]) - to_vec(landmarks[0])
+            finger = to_vec(landmarks[8]) - to_vec(landmarks[0])
+            if np.linalg.norm(thumb) == 0 or np.linalg.norm(finger) == 0:
+                valid = False
+            else:
+                grip = angle_between_vectors(thumb, finger)
+                valid = bool(np.isfinite(position).all() and
+                             np.isfinite([depth, grip, b_angle, roll_angle]).all())
+
+        if valid:
+            with tracking_lock:
+                if not tracking_state["visible"]:
+                    tracking_state["epoch"] += 1
+                tracking_state["visible"] = True
+                tracking_state["captured_at"] = captured_at
+                epoch = tracking_state["epoch"]
+            if filter_epoch != epoch:
+                filtered_pos, filtered_depth, filtered_grip = position, depth, grip
+                filter_epoch = epoch
+            else:
+                filtered_pos = 0.9 * filtered_pos + 0.1 * position
+                filtered_depth = 0.9 * filtered_depth + 0.1 * depth
+                filtered_grip = 0.9 * filtered_grip + 0.1 * grip
+
+            for connection in mp.tasks.vision.HandLandmarksConnections.HAND_CONNECTIONS:
+                start, end = landmarks[connection.start], landmarks[connection.end]
+                cv2.line(image, (int(start.x * width), int(start.y * height)),
+                         (int(end.x * width), int(end.y * height)), (0, 255, 0), 2)
+            for index, landmark in enumerate(landmarks):
+                point = (int(landmark.x * width), int(landmark.y * height))
+                cv2.circle(image, point, 3, (0, 255, 0), -1)
+                cv2.putText(image, str(index), (point[0] + 4, point[1] - 4),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 255), 1, cv2.LINE_AA)
+            cv2.arrowedLine(image, tuple(center.astype(int)),
+                            tuple((center + 50 * forward).astype(int)), (0, 0, 255), 2)
+            action = {"epoch": epoch, "captured_at": captured_at,
+                      "hand_pos": filtered_pos.copy(), "hand_depth": float(filtered_depth),
+                      "b_angle": b_angle, "roll_angle": roll_angle,
+                      "gripper_angle": float(filtered_grip)}
+            try:
+                action_queue.put_nowait(action)
+            except queue.Full:
+                pass
+        else:
+            with tracking_lock:
+                if tracking_state["visible"]:
+                    tracking_state["visible"] = False
+                    tracking_state["epoch"] += 1
+
+        with tracking_lock:
+            status = tracking_state["status"]
+        cv2.putText(image, status, (10, 25), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.6, (0, 255, 0) if status == "ACTIVE" else (0, 0, 255), 2)
+        cv2.imshow("SO-101 Hand Tracking", image)
+        if cv2.waitKey(5) & 0xFF == 27:
+            stop_event.set()
 
 def robot_process():
-    camera_action = {
-        "enabled": True,
-        "target_x": 0.0,
-        "target_y": 0.0,
-        "target_z": 0.0,
-        "target_wx": 0.0,
-        "target_wy": 0.0,
-        "target_wz": 0.0,   #Wrist rotate
-        "gripper_vel": 0.0,
-    }
+    pipeline = hand_to_robot_joints_processor
+    names = list(robot.bus.motors)
+    anchor = None
+    held = False
+    control_error = False
+    try:
+        while not stop_event.is_set():
+            start = time.monotonic()
+            with tracking_lock:
+                if (tracking_state["visible"] and
+                        start - tracking_state["captured_at"] > MAX_FRAME_AGE):
+                    tracking_state["visible"] = False
+                    tracking_state["epoch"] += 1
+                visible = tracking_state["visible"]
+                epoch = tracking_state["epoch"]
 
-    while not stop_event.is_set():
-        t0 = time.perf_counter()
+            # Uma perda pode ter ocorrido mesmo que a mão já tenha voltado.
+            if anchor is not None and anchor["epoch"] != epoch:
+                reading = robot.get_observation()
+                hold = {f"{name}.pos": reading[f"{name}.pos"] for name in names}
+                with tracking_lock:
+                    if tracking_state["epoch"] == epoch and not stop_event.is_set():
+                        robot.send_action(hold)
+                        anchor, held = None, True
+                        tracking_state["status"] = "PAUSED"
+                        print("PAUSED: referência anterior invalidada", flush=True)
+                continue
 
-        # Get robot observation
-        robot_obs = robot.get_observation()
+            if not visible:
+                with tracking_lock:
+                    tracking_state["status"] = "PAUSED"
+                if not held:
+                    reading = robot.get_observation()
+                    hold = {f"{name}.pos": reading[f"{name}.pos"] for name in names}
+                    with tracking_lock:
+                        if not tracking_state["visible"] and not stop_event.is_set():
+                            robot.send_action(hold)
+                            anchor, held = None, True
+                            print("PAUSED: mão indisponível", flush=True)
+                else:
+                    anchor = None
+                stop_event.wait(max(1 / FPS - (time.monotonic() - start), 0))
+                continue
 
-        #Set Robot Action
-        if not action_queue.empty():
-            action = action_queue.get()
+            sample = None
+            while True:
+                try:
+                    sample = action_queue.get_nowait()
+                except queue.Empty:
+                    break
+            if (sample is None or sample["epoch"] != epoch or
+                    time.monotonic() - sample["captured_at"] > MAX_FRAME_AGE):
+                stop_event.wait(max(1 / FPS - (time.monotonic() - start), 0))
+                continue
 
-            camera_action["target_x"] = action["target_x"]
-            camera_action["target_z"] = -action["target_y"]
-            camera_action["target_y"] = -action["target_z"]
-            camera_action["gripper_vel"] = action["gripper_vel"]*0.5
-            camera_action["target_wy"] = action["target_wy"]*0.01745
+            reading = robot.get_observation()
+            obs = {f"{name}.pos": reading[f"{name}.pos"] for name in names}
+            trial = copy.copy(pipeline)
+            trial.steps = [copy.copy(step) for step in pipeline.steps]
+            fresh = anchor is None or anchor["epoch"] != epoch
+            if fresh:
+                proposed = {"epoch": epoch, "pos": sample["hand_pos"].copy(),
+                            "depth": sample["hand_depth"], "b": sample["b_angle"],
+                            "roll": sample["roll_angle"], "grip": sample["gripper_angle"],
+                            "m1": obs["shoulder_pan.pos"], "m5": obs["wrist_roll.pos"]}
+                trial.steps[1].reset()
+                with tracking_lock:
+                    valid = (tracking_state["visible"] and tracking_state["epoch"] == epoch and
+                             0 <= time.monotonic() - sample["captured_at"] <= MAX_FRAME_AGE)
+                    if valid and not stop_event.is_set():
+                        if not held:
+                            sent = robot.send_action(obs)
+                            if sent != obs:
+                                raise RuntimeError("o comando enviado difere do calculado")
+                        anchor, pipeline, held = proposed, trial, False
+                        tracking_state["status"] = "ACTIVE"
+                        print("ACTIVE: nova referência", flush=True)
+                continue
+            else:
+                proposed = anchor.copy()
 
-        # Camera-hand deltas -> EE pose -> joints.
-        joint_action = hand_to_robot_joints_processor((camera_action, robot_obs))
+            targets = (
+                proposed["m1"] + angle_delta(sample["b_angle"], proposed["b"]),
+                proposed["m5"] + angle_delta(sample["roll_angle"], proposed["roll"]),
+            )
+            current_fixed = (obs["shoulder_pan.pos"], obs["wrist_roll.pos"])
+            if not fixed_targets_in_bounds(current_fixed, fixed_bounds):
+                raise RuntimeError(f"leitura M1/M5 fora da calibração: {current_fixed}")
+            if not fixed_targets_in_bounds(targets, fixed_bounds):
+                raise RuntimeError(f"alvo M1/M5 fora da calibração: {targets}")
+            kinematics_solver.fixed_targets = targets
+            camera_action = {
+                "enabled": True,
+                "target_x": sample["hand_pos"][0] - proposed["pos"][0],
+                "target_z": -(sample["hand_pos"][1] - proposed["pos"][1]),
+                "target_y": -(sample["hand_depth"] - proposed["depth"]),
+                "target_wx": 0.0, "target_wy": 0.0, "target_wz": 0.0,
+                "gripper_vel": (sample["gripper_angle"] - proposed["grip"]) * 0.5,
+            }
+            joint_action = trial((camera_action, obs))
+            proposed["grip"] = sample["gripper_angle"]
+            with tracking_lock:
+                valid = (tracking_state["visible"] and tracking_state["epoch"] == epoch and
+                         0 <= time.monotonic() - sample["captured_at"] <= MAX_FRAME_AGE)
+                if valid and not stop_event.is_set():
+                    sent = robot.send_action(joint_action)
+                    if sent != joint_action:
+                        raise RuntimeError("o comando enviado difere do calculado")
+                    anchor, pipeline, held = proposed, trial, False
+                    tracking_state["status"] = "ACTIVE"
+            stop_event.wait(max(1 / FPS - (time.monotonic() - start), 0))
+    except Exception as exc:
+        control_error = True
+        print(f"Erro no controlo do braço: {exc}", flush=True)
+        stop_event.set()
+    finally:
+        if vision_error.is_set() or control_error:
+            try:
+                reading = robot.get_observation()
+                hold = {f"{name}.pos": reading[f"{name}.pos"] for name in names}
+                robot.send_action(hold)
+                print("Erro no controlo ou visão: manutenção pedida", flush=True)
+            except Exception as exc:
+                print(f"Erro ao pedir manutenção: {exc}", flush=True)
 
-        # Send action to robot
-        _ = robot.send_action(joint_action)
-
-        time.sleep(max(1.0 / FPS - (time.perf_counter() - t0), 0.0))
+def run_vision(target):
+    try:
+        target()
+    except Exception as exc:
+        print(f"Erro na visão: {exc}", flush=True)
+        vision_error.set()
+        stop_event.set()
 
 # Start threads
-capture_thread = threading.Thread(target=frame_capture)
-display_thread = threading.Thread(target=frame_display)
+capture_thread = threading.Thread(target=run_vision, args=(frame_capture,))
+display_thread = threading.Thread(target=run_vision, args=(frame_display,))
 robot_thread = threading.Thread(target=robot_process)
 
 capture_thread.start()

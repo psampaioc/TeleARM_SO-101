@@ -7,6 +7,8 @@ status: proposed
 
 # Plano mínimo: M1 e M5 controlados pela mão
 
+> Registo histórico do plano aprovado: os trechos abaixo foram aplicados com pequenos ajustes de tratamento de erros. A validação com o braço físico permanece pendente; o comportamento atual está em [docs/README.md](README.md).
+
 Este é o plano revisto para aprovação. O objetivo é alterar o mínimo do controlador que já funciona: a seta B define M1 e a linha 5–17 define M5. M2–M4 continuam a ser calculados pela IK existente; M6 continua com o controlo atual da pinça. Não aplicar este plano ao código de teleoperação nem iniciar o braço antes da aprovação.
 
 ## O que fica no âmbito
@@ -168,21 +170,21 @@ MAX_FRAME_AGE = 0.5  # segundos sem imagem recente antes da pausa; ajustar no te
 
 `MAX_FRAME_AGE` é um prazo para detetar câmara parada, não um limite de movimento ou uma espera de estabilidade. Sem algum prazo, não existe no código atual um sinal que permita distinguir uma câmara parada de um intervalo normal entre frames. Na primeira amostra válida depois de `visible=False`, incrementar `epoch` e reiniciar os filtros `hand_pos`, `hand_depth`, `gripper_angle` e as referências da mão. Quando a mão não estiver presente ou `hand_geometry` retornar `None`, colocar `visible=False` e incrementar `epoch` uma vez na transição. Todas as leituras e escritas de `tracking_state` usam `tracking_lock`.
 
-No bloco de ação de `frame_display`, enviar **valores filtrados absolutos**, para que o consumidor possa descartar amostras antigas sem perder deltas de M6. Guardar uma cópia de `hand_pos`; os ângulos estão em graus. Substituir o dicionário atualmente colocado na `action_queue` por:
+No bloco de ação de `frame_display`, enviar **valores filtrados absolutos**, para que o consumidor possa descartar amostras antigas sem perder deltas de M6. O trecho seguinte já está incluído na substituição completa de `frame_display()` abaixo; não deve ser aplicado uma segunda vez. Os ângulos estão em graus:
 
 ```python
 action = {
     "epoch": epoch,
     "captured_at": captured_at,
-    "hand_pos": hand_pos.copy(),
-    "hand_depth": float(hand_depth),
+    "hand_pos": filtered_pos.copy(),
+    "hand_depth": float(filtered_depth),
     "b_angle": b_angle,
     "roll_angle": roll_angle,
-    "gripper_angle": float(gripper_angle),
+    "gripper_angle": float(filtered_grip),
 }
 ```
 
-O produtor só publica a ação se a captura ainda tiver idade válida. O consumidor retira a amostra mais recente e rejeita epochs anteriores. Ao reentrar, usa a amostra e uma leitura do braço no mesmo ciclo para criar as referências; a primeira ordem é manutenção das posições lidas. O delta da garra passa a ser calculado entre amostras efetivamente consumidas, mantendo o mesmo fator 0,5 e `GripperVelocityToJoint(speed_factor=20)` que já existem.
+O produtor só publica a ação se a captura ainda tiver idade válida. O consumidor retira a amostra mais recente e rejeita epochs anteriores. Ao reentrar, usa a amostra e uma leitura do braço no mesmo ciclo para criar as referências. Antes de qualquer IK, envia uma manutenção das posições lidas se ainda não o tiver feito nessa pausa. A referência cartesiana do LeRobot é capturada na primeira amostra posterior que passar pela cadeia. O delta da garra passa a ser calculado entre amostras efetivamente consumidas, mantendo o mesmo fator 0,5 e `GripperVelocityToJoint(speed_factor=20)` que já existem.
 
 ### Candidato do produtor de visão
 
@@ -286,7 +288,7 @@ def robot_process():
     pipeline = hand_to_robot_joints_processor
     names = list(robot.bus.motors)
     anchor = None
-    held = True
+    held = False
     try:
         while not stop_event.is_set():
             start = time.monotonic()
@@ -298,18 +300,31 @@ def robot_process():
                 visible = tracking_state["visible"]
                 epoch = tracking_state["epoch"]
 
+            # Uma perda pode ter ocorrido mesmo que a mão já tenha voltado.
+            if anchor is not None and anchor["epoch"] != epoch:
+                reading = robot.get_observation()
+                hold = {f"{name}.pos": reading[f"{name}.pos"] for name in names}
+                with tracking_lock:
+                    if tracking_state["epoch"] == epoch and not stop_event.is_set():
+                        robot.send_action(hold)
+                        anchor, held = None, True
+                        tracking_state["status"] = "PAUSED"
+                        print("PAUSED: referência anterior invalidada", flush=True)
+                continue
+
             if not visible:
-                anchor = None
                 with tracking_lock:
                     tracking_state["status"] = "PAUSED"
                 if not held:
                     reading = robot.get_observation()
                     hold = {f"{name}.pos": reading[f"{name}.pos"] for name in names}
                     with tracking_lock:
-                        if not tracking_state["visible"]:
+                        if not tracking_state["visible"] and not stop_event.is_set():
                             robot.send_action(hold)
-                            held = True
+                            anchor, held = None, True
                             print("PAUSED: mão indisponível", flush=True)
+                else:
+                    anchor = None
                 stop_event.wait(max(1 / FPS - (time.monotonic() - start), 0))
                 continue
 
@@ -335,6 +350,18 @@ def robot_process():
                             "roll": sample["roll_angle"], "grip": sample["gripper_angle"],
                             "m1": obs["shoulder_pan.pos"], "m5": obs["wrist_roll.pos"]}
                 trial.steps[1].reset()
+                with tracking_lock:
+                    valid = (tracking_state["visible"] and tracking_state["epoch"] == epoch and
+                             0 <= time.monotonic() - sample["captured_at"] <= MAX_FRAME_AGE)
+                    if valid and not stop_event.is_set():
+                        if not held:
+                            sent = robot.send_action(obs)
+                            if sent != obs:
+                                raise RuntimeError("o comando enviado difere do calculado")
+                        anchor, pipeline, held = proposed, trial, False
+                        tracking_state["status"] = "ACTIVE"
+                        print("ACTIVE: nova referência", flush=True)
+                continue
             else:
                 proposed = anchor.copy()
 
@@ -362,14 +389,11 @@ def robot_process():
                 valid = (tracking_state["visible"] and tracking_state["epoch"] == epoch and
                          0 <= time.monotonic() - sample["captured_at"] <= MAX_FRAME_AGE)
                 if valid and not stop_event.is_set():
-                    requested = obs if fresh else joint_action
-                    sent = robot.send_action(requested)
-                    if sent != requested:
+                    sent = robot.send_action(joint_action)
+                    if sent != joint_action:
                         raise RuntimeError("o comando enviado difere do calculado")
                     anchor, pipeline, held = proposed, trial, False
                     tracking_state["status"] = "ACTIVE"
-                    if fresh:
-                        print("ACTIVE: nova referência", flush=True)
             stop_event.wait(max(1 / FPS - (time.monotonic() - start), 0))
     except Exception as exc:
         print(f"Erro no controlo do braço: {exc}", flush=True)
@@ -378,9 +402,15 @@ def robot_process():
 
 O lock mantém a verificação e a chamada serial na mesma secção; uma escrita já iniciada não pode ser cancelada e pode atrasar a atualização da visão. Uma exceção serial pode ocorrer após uma escrita parcial: o código informa e termina, sem garantir que o braço parou. Ao retomar, a proteção `EEBoundsAndSafety` conserva o histórico; se rejeitar a nova referência, o erro deve ser informado, não contornado.
 
+**Por que manter a cópia da cadeia?** Retirar só a amostra mais recente evita processar a fila antiga, mas uma ação pode ficar inválida *enquanto a IK está a ser calculada*. Os processadores alteram estado durante esse cálculo; a cópia permite descartar os passos alterados se a época mudar. O solver nativo continua partilhado e esta propriedade tem de ser verificada; manter o lock durante toda a IK também evitaria essa corrida, mas atrasaria a visão. A primeira amostra nova agora estabelece a referência e, quando necessário, pede manutenção **sem executar IK**; o cálculo de movimento começa com a amostra seguinte.
+
 **Verificações básicas feitas no container temporário:** os blocos passaram análise de sintaxe; com pontos sintéticos, a geometria devolveu ângulos válidos; com o solver/URDF instalados, a classe manteve os dois alvos impostos. Um ensaio encadeou os trechos literais do produtor e consumidor com PlaCo e processadores LeRobot reais, usando imagens, mão, calibração e robô simulados: entrada, movimento, perda e retorno passaram; o estado voltou a `ACTIVE`, um alvo fora da calibração sintética foi rejeitado, e `PAUSED` foi registado na perda. A interface gráfica foi simulada. Nenhum ensaio comprova a resposta da câmara, serial ou braço físico.
 
-No teste sem hardware, verificar perda, amostra expirada, ausência de repetição de M6, retorno noutro ponto e rejeição de uma ação antiga. Simular também falha de leitura/escrita e duas pausas consecutivas. O ensaio integrado básico acima cobre apenas uma perda e um retorno; as restantes situações continuam por verificar antes de as considerar comprovadas.
+**Revisão da perda rápida:** depois de alterar o consumidor, um ensaio determinístico com relógio, robô e pipeline simulados fez a mão desaparecer e regressar entre dois ciclos: a mudança de `epoch` provocou manutenção antes da nova IK. Outro ensaio com produtor e consumidor literais, PlaCo e processadores LeRobot reais, e câmara/robô simulados confirmou manutenção inicial antes da primeira IK, movimento, perda, reancoragem e novo movimento. Uma revisão independente confirmou que o código conserva a proteção cartesiana. A manutenção é apenas um pedido aos servos; se já tiver sido enviada durante a pausa, a referência seguinte usa nova leitura, que pode diferir ligeiramente.
+
+Um terceiro ensaio determinístico do consumidor atual, com robô/pipeline/relógio simulados, passou duas perdas e retornos rápidos, descartou uma ação antiga e aplicou o delta da garra uma vez; falhas simuladas de leitura e escrita terminaram o controlo com erro. Um ensaio separado da IK com M1/M5 fixados atingiu um alvo sintético próximo, mas para um alvo artificialmente inalcançável o solver retornou uma solução ainda a 1,195 m do alvo. Este último ensaio chamou a IK diretamente, sem a proteção cartesiana da cadeia: comprova que retorno do solver não garante que o alvo foi atingido, não que este comando específico seria enviado pelo programa completo. O plano não acrescenta um novo limite de movimento; o comportamento deve ser observado pelo operador no teste supervisionado.
+
+As falhas, perdas rápidas e ação antiga acima foram simuladas com o controlador candidato isolado, não com câmara ou serial reais. Outro ensaio básico confirmou que uma imagem expirada faz o consumidor pedir manutenção e indicar `PAUSED`. A concorrência real com câmara e serial continua por verificar; o ensaio integrado básico usou uma perda e um retorno. A verificação física é separada e fica para o operador quando autorizar a implementação e o live.
 
 ## Sequência quando a implementação for autorizada
 

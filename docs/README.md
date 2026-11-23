@@ -1,6 +1,6 @@
 # TeleARM — guia do projeto
 
-Este é o documento de referência do checkout: estado atual, comandos, pipeline, segurança, mapa de ficheiros, hardware e fontes. O [README da raiz](../README.md) fica como entrada rápida. Esta documentação descreve o estado conhecido em **12 de novembro de 2026**; hardware e container podem mudar.
+Este é o documento de referência do checkout: estado atual, comandos, pipeline, segurança, mapa de ficheiros, hardware e fontes. O [README da raiz](../README.md) fica como entrada rápida. Esta atualização de controlo ainda precisa de validação física.
 
 ## Índice
 
@@ -17,7 +17,7 @@ Este é o documento de referência do checkout: estado atual, comandos, pipeline
 
 ## Arranque e segurança
 
-O entry point atual inicia **teleoperação live**: não existe pré-visualização sem braço. Ao iniciar, o programa abre a webcam, conecta o follower, lê os motores e envia ações mesmo antes de aparecer uma mão. Executa apenas com o operador ao lado, sem carga, braço apoiado, trajeto livre e corte físico de energia acessível. A mão que aparece no enquadramento já pode comandar o braço; perder a mão não provoca HOLD.
+O entry point atual inicia **teleoperação live**: não existe pré-visualização sem braço. Ao iniciar, o programa abre a webcam, conecta o follower, lê os motores e pede manutenção da posição enquanto espera pela mão. Executa apenas com o operador ao lado, sem carga, braço apoiado, trajeto livre e corte físico de energia acessível. A primeira mão válida estabelece uma referência; amostras seguintes podem comandar o braço. Na perda, o programa pede manutenção da posição lida: isso não comprova paragem física.
 
 Na raiz do projeto, inicia um container temporário sem reconstruir a imagem:
 
@@ -58,7 +58,8 @@ O sistema é um protótipo experimental. Em 12/11/2026 o operador reportou que o
 | LeRobot lê o follower, resolve a ação e envia posições | Implementado no código. Uma chamada aceite não prova que todos os servos executaram corretamente. |
 | Braço seguiu a mão | Um movimento visível foi reportado pelo operador; ainda não é validação repetível. |
 | XYZ em centímetros, com escala real | Não implementado nem validado. X/Y são relativos à imagem; “Z” é variação de tamanho aparente. |
-| Gripper segue a mão | Não validado; usa mudança de ângulo 2D e pode repetir o último delta. |
+| Gripper segue a mão | A versão atual usa mudança de ângulo 2D e consome cada amostra uma vez; ainda não foi validada no braço. |
+| Seta B, M1/M5 e pausa | Implementação nova verificada em simulação; direção, sensibilidade e pausa física ainda não foram validadas no braço. |
 | Orientação 3D da palma, feedback visual ou Rerun | Não implementados nesta cadeia. |
 | Leitura serial e encerramento após falha | Não confiáveis ainda; timeout no Motor 1 e torque final desconhecido. |
 | Latência p50/p95 live | Não é medida de forma fiável pelo programa atual. Não reutilizar as métricas de versões anteriores. |
@@ -78,8 +79,8 @@ Container existente
 Um processo Python tem três threads:
 
 1. **Captura:** OpenCV abre `/dev/video0`, pede V4L2, 640×480 e 30 FPS, e coloca frames BGR numa fila de até cinco imagens. `cap.set()` não confirma que o modo foi aceite. Se a fila encher, o código descarta o frame novo.
-2. **Tracking e janela:** converte BGR para RGB, chama MediaPipe Tasks em modo VIDEO (uma mão; limiares 0,5), calcula características, desenha esqueleto e envia ações para uma fila de até 100 itens. `detect_for_video()` é síncrono nesta thread. A imagem mostra pontos verdes sem números.
-3. **Braço:** lê posições do follower, consome no máximo uma ação por ciclo, aplica os processadores LeRobot e escreve alvos. Frequência nominal do ciclo: 45 Hz. A escrita de `Goal_Position` não prova que a posição física foi atingida.
+2. **Tracking e janela:** converte BGR para RGB, chama MediaPipe Tasks em modo VIDEO (uma mão; limiares 0,5), calcula características, desenha esqueleto com números e seta B e envia amostras para uma fila de até 100 itens. `detect_for_video()` é síncrono nesta thread.
+3. **Braço:** lê posições do follower, usa a amostra válida mais recente, aplica os processadores LeRobot e escreve alvos. Frequência nominal do ciclo: 45 Hz. A escrita de `Goal_Position` não prova que a posição física foi atingida.
 
 O comando `deskarm` abre um shell; o container não inicia teleoperação sozinho. O entry point inicializa hardware ao ser executado e pode fazê-lo também durante importação. A webcam é solicitada a 30 FPS e o ciclo do braço tenta 45 Hz; são frequências diferentes, não uma medição de latência ponta a ponta.
 
@@ -89,11 +90,11 @@ MediaPipe fornece 21 landmarks de imagem normalizados (`x`,`y` entre 0 e 1, tipi
 
 ### Posição e escala aparente
 
-- A posição segue o landmark **2** (base do polegar), não o centro da palma. Na primeira deteção guarda-se uma origem visual; não há gesto PALM nem sincronização desta origem com a referência do braço.
+- A posição segue o landmark **2** (base do polegar), não o centro da palma. A primeira deteção válida e cada retorno após pausa criam uma nova origem visual e registam as posições dos motores; não há gesto PALM.
 - `u = x₂ − x₂ inicial` e `v = y₂ − y₂ inicial`. São deslocamentos em coordenadas normalizadas de imagem, não centímetros.
 - A estimativa chamada `depth_estimate()` soma os comprimentos 2D das cadeias `0–1–2–3–4` e `0–5–6–7–8`. A diferença em relação à amostra inicial é usada como proxy de escala aparente.
 - Rodar ou abrir a mão também altera os comprimentos projetados. O código ignora o `z` de MediaPipe, não conhece o tamanho real da mão e não mede distância física à lente. Portanto `target_z` não é profundidade métrica.
-- Posição, escala e ângulos passam por média exponencial: 90% do valor anterior + 10% da amostra atual. Reduz tremor e acrescenta atraso.
+- Posição, escala e ângulo da garra passam por média exponencial: 90% do valor anterior + 10% da amostra atual. Os ângulos de M1/M5 não são filtrados. A média reduz tremor e acrescenta atraso.
 
 O remapeamento do código para os processadores é:
 
@@ -109,11 +110,12 @@ Essas escalas convertem grandezas relativas para deslocamentos que a pipeline in
 
 - O gripper usa o ângulo 2D entre os vetores pulso→ponta do polegar (`0→4`) e pulso→ponta do indicador (`0→8`). Envia a diferença do ângulo anterior, multiplicada por 0,5 no ciclo do robô.
 - `GripperVelocityToJoint` aplica `speed_factor=20`, soma a variação à leitura atual e limita o alvo numérico a 0–100. Isto não é uma medida direta da abertura da mão nem prova qual extremo físico abre/fecha.
-- A rotação aproximada usa a mudança do vetor `0→4` relativamente à amostra inicial e a orientação vertical da imagem. É um proxy angular 2D, não a normal 3D da palma.
-- O helper angular normaliza os vetores sem tratar explicitamente o caso de vetor nulo; uma deteção degenerada pode gerar valor inválido.
-- Quando não chegam ações novas, o estado conserva a ação anterior. Perder a mão não aciona HOLD e um delta de gripper pode voltar a ser aplicado.
+- A seta B é perpendicular à linha ajustada aos pontos 5, 9, 13 e 17; a sua variação angular em 2D comanda M1. A variação da linha 5–17 comanda M5. Estes dois sinais podem mudar juntos e não representam orientação 3D completa.
+- A IK ainda usa `gripper_frame_link`, cujo ponto está cerca de 7,9 mm fora do eixo de M5 no URDF. A rotação de M5 pode, por isso, levar a compensações em M2–M4; um ponto sobre o eixo ainda não foi introduzido.
+- Uma geometria ou vetores inválidos são tratados como ausência da mão. A perda ou imagem antiga provoca pausa e um pedido de manutenção; a primeira amostra válida após o regresso reancora, e uma amostra posterior volta a mover.
+- Um comando já em transmissão não pode ser cancelado; erros de leitura/escrita ou o pedido de manutenção não garantem paragem física.
 
-As referências da mão e do braço não são uma única âncora: a mão é inicializada na primeira deteção e a pose cartesiana do end-effector é fixada no primeiro ciclo do braço. Não há PALM/FIST/PINCH, centroide da mão, handedness usado, landmarks world, normal 3D ou profundidade por sensor.
+Na retomada, a mão e as juntas são ancoradas no mesmo ciclo; a referência cartesiana é capturada pela cadeia na amostra seguinte. Não há PALM/FIST/PINCH, centroide da mão, handedness usado, landmarks world, normal 3D ou profundidade por sensor.
 
 ### Funções para estudar no código
 
@@ -122,9 +124,9 @@ As referências da mão e do braço não são uma única âncora: a mão é inic
 | `frame_capture()` | `Brosnantest/hand_camera_teleop.py` | Lê frames da webcam e gere a fila de imagem. |
 | `to_vec()` | mesmo | Extrai `x,y` normalizados de um landmark; ignora `z`. |
 | `angle_between_vectors()` | mesmo | Calcula ângulo 2D pelo produto escalar e `arccos`. |
-| `angle_between_vectors2()` | mesmo | Dá sinal ao ângulo do polegar com referência ao eixo vertical da imagem. |
+| `hand_geometry()` | mesmo | Calcula seta B e orientação da linha 5–17 na imagem. |
 | `depth_estimate()` | mesmo | Soma os segmentos 2D do polegar e indicador como proxy de tamanho aparente. |
-| `frame_display()` | mesmo | Corre MediaPipe, suaviza características, desenha pontos e publica deltas. |
+| `frame_display()` | mesmo | Corre MediaPipe, suaviza características, desenha pontos e publica amostras. |
 | `robot_process()` | mesmo | Lê o follower, remapeia os campos, executa processadores/IK e envia ações. |
 | `MapCameraHandActionToRobotAction.action()` | `Brosnantest/camera_processor.py` | Identidade: não transforma os valores numéricos. |
 | `transform_features()` | mesmo | Declara os campos do schema que LeRobot espera. |
@@ -136,10 +138,10 @@ O nome de registo `map_phone_action_to_robot_action` e a remoção de campos ant
 A cadeia de processadores atual, por ordem:
 
 1. **`MapCameraHandActionToRobotAction`:** adaptador de schema local, ação identidade.
-2. **`EEReferenceAndDelta`:** calcula a pose de `gripper_frame_link` pela leitura articular e fixa uma referência no início do ciclo do braço. Multiplica alvos pelos ganhos e soma à referência; não espera PALM.
+2. **`EEReferenceAndDelta`:** calcula a pose de `gripper_frame_link` pela leitura articular e fixa uma referência após cada reancoragem. Multiplica alvos pelos ganhos e soma à referência; não espera PALM.
 3. **`EEBoundsAndSafety`:** limita posição à caixa configurada e passo máximo de 0,10 m. O erro de salto pode parar a execução; não é um limitador gradual.
 4. **`GripperVelocityToJoint`:** integra a velocidade angular do gripper num alvo numérico 0–100.
-5. **`InverseKinematicsEEToJoints`:** LeRobot `RobotKinematics` com PlaCo resolve as cinco juntas do braço usando o URDF e as juntas observadas como inicialização. Peso de orientação 0,01 dá prioridade à posição. O gripper é independente da IK.
+5. **`InverseKinematicsEEToJoints`:** LeRobot e PlaCo resolvem M2–M4, mantendo M1 e M5 nos alvos calculados da mão. A solução usa o URDF e uma inicialização baseada nas juntas observadas. O gripper é independente da IK.
 
 `SO101Follower` do LeRobot lê/escreve as posições `.pos` por Feetech. O LeRobot é dono do protocolo serial, calibração de motor e conversão. O ciclo é alvo de posição mais readback, não um PID em Python. Ao conectar, o LeRobot configura PID no servo (P=16, I=0, D=32 na versão 0.7 analisada).
 
@@ -150,7 +152,7 @@ A cadeia de processadores atual, por ordem:
 | Conversão servo e limites do solver | Camadas diferentes. O código não monta explicitamente uma interseção de limites entre calibração JSON e URDF. |
 | Readback/escrita serial | A leitura informa estado articular para o ciclo seguinte; uma escrita aceite não comprova execução física correta. |
 
-Mapeamento do hardware: Motor 1 `shoulder_pan`/base; Motor 2 `shoulder_lift`; Motor 3 `elbow_flex`; Motor 4 `wrist_flex`; Motor 5 `wrist_roll`; Motor 6 gripper. Motores 1–5 resolvem a pose do braço em conjunto; Motor 6 atua na garra separadamente. Os limites locais do URDF para Motores 2 e 3 foram alargados num ensaio temporário; não são limites mecânicos confirmados nem devem ser interpretados como envelope seguro.
+Mapeamento do hardware: Motor 1 `shoulder_pan`/base; Motor 2 `shoulder_lift`; Motor 3 `elbow_flex`; Motor 4 `wrist_flex`; Motor 5 `wrist_roll`; Motor 6 gripper. M1/M5 recebem alvos diretos e são considerados pela IK de M2–M4; M6 atua separadamente. Os limites locais do URDF para Motores 2 e 3 foram alargados num ensaio temporário; não são limites mecânicos confirmados nem devem ser interpretados como envelope seguro.
 
 ## Mapa do repositório
 
