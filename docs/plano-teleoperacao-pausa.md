@@ -70,6 +70,32 @@ class FixedJointKinematics(RobotKinematics):
         return super().inverse_kinematics(joints, desired_ee_pose, *args, **kwargs)
 ```
 
+#### Respeitar a calibração já existente
+
+O LeRobot instalado não recorta automaticamente os comandos em graus pelos extremos da calibração, e a máscara fixa a junta no valor recebido. Assim, verificar os dois alvos contra os limites **já registados**, sem criar novos valores. Colocar estas funções perto da classe anterior; após `robot.connect()` e antes de iniciar as threads, executar `fixed_bounds = calibrated_fixed_bounds(robot.bus)`. `_normalize` é método privado da versão instalada: se a API falhar, terminar com erro em vez de continuar sem verificação.
+
+```python
+def calibrated_fixed_bounds(bus):
+    bounds = {}
+    for name in ("shoulder_pan", "wrist_roll"):
+        motor = bus.motors[name]
+        cal = bus.calibration[name]
+        if cal.id != motor.id or cal.range_min >= cal.range_max:
+            raise ValueError(f"calibração inválida: {name}")
+        low = float(bus._normalize({motor.id: cal.range_min})[motor.id])
+        high = float(bus._normalize({motor.id: cal.range_max})[motor.id])
+        if not np.isfinite([low, high]).all() or low >= high:
+            raise ValueError(f"limites calibrados inválidos: {name}")
+        bounds[name] = (low, high)
+    return bounds
+
+def fixed_targets_in_bounds(targets, bounds):
+    return all(np.isfinite(value) and bounds[name][0] <= value <= bounds[name][1]
+               for name, value in zip(("shoulder_pan", "wrist_roll"), targets))
+```
+
+No consumidor, construir primeiro os dois valores numa variável `targets`; verificar a leitura atual e depois os alvos com `fixed_targets_in_bounds`. Caso falhem, parar e mostrar o motor/leitura para diagnóstico; não comandar automaticamente um movimento para dentro da faixa. Só após passar, atribuir `kinematics_solver.fixed_targets = targets`. A calibração de M5 pode cobrir uma volta completa e não confirma a liberdade física dos cabos. Esta verificação não garante alcance da IK, colisões ou paragem física.
+
 A thread do robô define `kinematics_solver.fixed_targets = (alvo_m1_graus, alvo_m5_graus)` antes da cadeia. A versão instalada do processador LeRobot monta o vetor pela ordem das posições no dicionário da observação; é necessário verificar que essa ordem corresponde a `robot.bus.motors` antes de o usar. Esta classe preserva a leitura real para a FK de referência. A integração com a pausa é descrita abaixo; não aplicar este trecho isoladamente.
 
 ## Sinais da mão
@@ -136,7 +162,7 @@ Acrescentar `import copy` junto dos imports; depois de `action_queue = queue.Que
 
 ```python
 tracking_lock = threading.Lock()
-tracking_state = {"visible": False, "epoch": 0, "captured_at": 0.0}
+tracking_state = {"visible": False, "epoch": 0, "captured_at": 0.0, "status": "PAUSED"}
 MAX_FRAME_AGE = 0.5  # segundos sem imagem recente antes da pausa; ajustar no teste
 ```
 
@@ -160,7 +186,7 @@ O produtor só publica a ação se a captura ainda tiver idade válida. O consum
 
 ### Candidato do produtor de visão
 
-O seguinte substituiria `frame_display()` no mesmo ficheiro; pressupõe a alteração de `frame_capture()` e as funções/variáveis anteriores. Conserva os pontos numerados e o cálculo de garra atual. **Ainda precisa de verificação conjunta** com o consumidor abaixo antes de ser considerado um patch pronto.
+O seguinte substituiria `frame_display()` no mesmo ficheiro; pressupõe a alteração de `frame_capture()` e as funções/variáveis anteriores. Conserva os pontos numerados e o cálculo de garra atual. Passou o ensaio integrado básico descrito abaixo com mão e robô simulados; ainda não foi aplicado ao controlador nem testado com dispositivos reais.
 
 ```python
 def frame_display():
@@ -240,6 +266,10 @@ def frame_display():
                     tracking_state["visible"] = False
                     tracking_state["epoch"] += 1
 
+        with tracking_lock:
+            status = tracking_state["status"]
+        cv2.putText(image, status, (10, 25), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.6, (0, 255, 0) if status == "ACTIVE" else (0, 0, 255), 2)
         cv2.imshow("SO-101 Hand Tracking", image)
         if cv2.waitKey(5) & 0xFF == 27:
             stop_event.set()
@@ -270,6 +300,8 @@ def robot_process():
 
             if not visible:
                 anchor = None
+                with tracking_lock:
+                    tracking_state["status"] = "PAUSED"
                 if not held:
                     reading = robot.get_observation()
                     hold = {f"{name}.pos": reading[f"{name}.pos"] for name in names}
@@ -306,10 +338,16 @@ def robot_process():
             else:
                 proposed = anchor.copy()
 
-            kinematics_solver.fixed_targets = (
+            targets = (
                 proposed["m1"] + angle_delta(sample["b_angle"], proposed["b"]),
                 proposed["m5"] + angle_delta(sample["roll_angle"], proposed["roll"]),
             )
+            current_fixed = (obs["shoulder_pan.pos"], obs["wrist_roll.pos"])
+            if not fixed_targets_in_bounds(current_fixed, fixed_bounds):
+                raise RuntimeError(f"leitura M1/M5 fora da calibração: {current_fixed}")
+            if not fixed_targets_in_bounds(targets, fixed_bounds):
+                raise RuntimeError(f"alvo M1/M5 fora da calibração: {targets}")
+            kinematics_solver.fixed_targets = targets
             camera_action = {
                 "enabled": True,
                 "target_x": sample["hand_pos"][0] - proposed["pos"][0],
@@ -329,6 +367,7 @@ def robot_process():
                     if sent != requested:
                         raise RuntimeError("o comando enviado difere do calculado")
                     anchor, pipeline, held = proposed, trial, False
+                    tracking_state["status"] = "ACTIVE"
                     if fresh:
                         print("ACTIVE: nova referência", flush=True)
             stop_event.wait(max(1 / FPS - (time.monotonic() - start), 0))
@@ -339,9 +378,9 @@ def robot_process():
 
 O lock mantém a verificação e a chamada serial na mesma secção; uma escrita já iniciada não pode ser cancelada e pode atrasar a atualização da visão. Uma exceção serial pode ocorrer após uma escrita parcial: o código informa e termina, sem garantir que o braço parou. Ao retomar, a proteção `EEBoundsAndSafety` conserva o histórico; se rejeitar a nova referência, o erro deve ser informado, não contornado.
 
-**Verificações básicas feitas no container temporário:** os blocos da geometria, produtor e consumidor passaram análise de sintaxe; com pontos sintéticos, a geometria devolveu ângulos válidos; com o solver/URDF instalados, a classe manteve os dois alvos impostos. Com relógio, pipeline e robô simulados, o consumidor passou entrada, ação nova, pausa e retorno noutro ponto. Estas verificações não executaram o produtor de visão completo nem o consumidor junto do solver real; não comprovam a resposta da câmara, serial ou braço.
+**Verificações básicas feitas no container temporário:** os blocos passaram análise de sintaxe; com pontos sintéticos, a geometria devolveu ângulos válidos; com o solver/URDF instalados, a classe manteve os dois alvos impostos. Um ensaio encadeou os trechos literais do produtor e consumidor com PlaCo e processadores LeRobot reais, usando imagens, mão, calibração e robô simulados: entrada, movimento, perda e retorno passaram; o estado voltou a `ACTIVE`, um alvo fora da calibração sintética foi rejeitado, e `PAUSED` foi registado na perda. A interface gráfica foi simulada. Nenhum ensaio comprova a resposta da câmara, serial ou braço físico.
 
-No teste sem hardware, verificar perda, amostra expirada, ausência de repetição de M6, retorno noutro ponto e rejeição de uma ação antiga. Simular também falha de leitura/escrita e duas pausas consecutivas. O mecanismo exato ainda precisa de ser integrado e revisto: as simulações anteriores com cópia dos processadores ajudaram, mas não demonstraram o fluxo completo com a IK modificada e amostras inéditas.
+No teste sem hardware, verificar perda, amostra expirada, ausência de repetição de M6, retorno noutro ponto e rejeição de uma ação antiga. Simular também falha de leitura/escrita e duas pausas consecutivas. O ensaio integrado básico acima cobre apenas uma perda e um retorno; as restantes situações continuam por verificar antes de as considerar comprovadas.
 
 ## Sequência quando a implementação for autorizada
 
