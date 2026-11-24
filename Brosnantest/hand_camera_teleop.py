@@ -43,19 +43,21 @@ class FixedJointKinematics(RobotKinematics):
         super().__init__(*args, **kwargs)
         self.fixed_targets = None
         self.base_index = self.joint_names.index("shoulder_pan")
+        self.pitch_index = self.joint_names.index("wrist_flex")
         self.roll_index = self.joint_names.index("wrist_roll")
         self.solver.mask_dof("shoulder_pan")
+        self.solver.mask_dof("wrist_flex")
         self.solver.mask_dof("wrist_roll")
 
     def inverse_kinematics(self, current_joint_pos, desired_ee_pose, *args, **kwargs):
         joints = np.array(current_joint_pos, dtype=float, copy=True)
         if self.fixed_targets is not None:
-            joints[self.base_index], joints[self.roll_index] = self.fixed_targets
+            joints[self.base_index], joints[self.pitch_index], joints[self.roll_index] = self.fixed_targets
         return super().inverse_kinematics(joints, desired_ee_pose, *args, **kwargs)
 
 def calibrated_fixed_bounds(bus):
     bounds = {}
-    for name in ("shoulder_pan", "wrist_roll"):
+    for name in ("shoulder_pan", "wrist_flex", "wrist_roll"):
         motor = bus.motors[name]
         cal = bus.calibration[name]
         if cal.id != motor.id or cal.range_min >= cal.range_max:
@@ -68,8 +70,8 @@ def calibrated_fixed_bounds(bus):
     return bounds
 
 def fixed_targets_in_bounds(targets, bounds):
-    return all(np.isfinite(value) and bounds[name][0] <= value <= bounds[name][1]
-               for name, value in zip(("shoulder_pan", "wrist_roll"), targets))
+    return len(targets) == 3 and all(np.isfinite(value) and bounds[name][0] <= value <= bounds[name][1]
+               for name, value in zip(("shoulder_pan", "wrist_flex", "wrist_roll"), targets))
 
 FPS = 45
 
@@ -84,7 +86,7 @@ robot = SO101Follower(robot_config)
 # NOTE: It is highly recommended to use the urdf in the SO-ARM100 repo: https://github.com/TheRobotStudio/SO-ARM100/blob/main/Simulation/SO101/so101_new_calib.urdf
 kinematics_solver = FixedJointKinematics(
     urdf_path="/workspace/teleop/models/so101/so101_new_calib.urdf",
-    target_frame_name="gripper_frame_link",
+    target_frame_name="wrist_link",
     joint_names=list(robot.bus.motors.keys()),
 )
 
@@ -166,6 +168,7 @@ action_queue = queue.Queue(maxsize=100)
 tracking_lock = threading.Lock()
 tracking_state = {"visible": False, "epoch": 0, "captured_at": 0.0, "status": "PAUSED"}
 MAX_FRAME_AGE = 0.5
+MAX_IK_ERROR_M = 0.005
 
 def frame_capture():
     while not stop_event.is_set():
@@ -179,31 +182,34 @@ def frame_capture():
 def to_vec(landmark):
     return np.array([landmark.x, landmark.y])
 
-def hand_geometry(landmarks, width, height):
-    points = np.array([[landmarks[i].x * width, landmarks[i].y * height]
-                       for i in (5, 9, 13, 17)], dtype=np.float32)
-    wrist = np.array([landmarks[0].x * width, landmarks[0].y * height])
-    if not np.isfinite(points).all() or not np.isfinite(wrist).all():
-        return None
-    span = points[-1] - points[0]
-    if np.linalg.norm(span) < 1.0:
-        return None
-    vx, vy, cx, cy = cv2.fitLine(points, cv2.DIST_L2, 0, 0.01, 0.01).flatten()
-    line = np.array([vx, vy])
-    if np.dot(line, span) < 0:
-        line = -line
-    center = np.array([cx, cy])
-    forward = np.array([-line[1], line[0]])
-    projection = np.dot(forward, center - wrist)
-    if abs(projection) < 1.0:
-        return None
-    if projection < 0:
-        forward = -forward
-    return (float(np.degrees(np.arctan2(forward[1], forward[0]))),
-            float(np.degrees(np.arctan2(span[1], span[0]))), center, forward)
-
 def angle_delta(angle, reference):
     return (angle - reference + 180.0) % 360.0 - 180.0
+
+def direction_angles(world_landmarks):
+    points = np.array([[world_landmarks[i].x, world_landmarks[i].y, world_landmarks[i].z]
+                       for i in (0, 2, 4, 5)], dtype=float)
+    if not np.isfinite(points).all():
+        return None
+    forward = points[2] - points[1]
+    length = np.linalg.norm(forward)
+    if length < 1e-6:
+        return None
+    x, y, z = forward / length
+    if np.hypot(x, z) < 0.1:
+        return None
+    forward = forward / length
+    side = points[3] - points[0]
+    side_length = np.linalg.norm(side)
+    side = side - np.dot(side, forward) * forward
+    if side_length < 1e-6 or np.linalg.norm(side) < 0.1 * side_length:
+        return None
+    up = np.array([0., -1., 0.])
+    up -= np.dot(up, forward) * forward
+    up /= np.linalg.norm(up)
+    right = np.cross(up, forward)
+    roll = np.degrees(np.arctan2(np.dot(side, right), np.dot(side, up)))
+    return (float(np.degrees(np.arctan2(x, z))),
+            float(np.degrees(np.arctan2(-y, np.hypot(x, z)))), float(roll))
 
 def angle_between_vectors(v1, v2):
     # Normalize the vectors
@@ -237,6 +243,7 @@ def depth_estimate(hand_landmarks):
 
 def frame_display():
     filtered_pos = filtered_depth = filtered_grip = None
+    filtered_yaw = filtered_pitch = filtered_roll = None
     filter_epoch = None
     last_video_timestamp = 0
     while not stop_event.is_set():
@@ -258,12 +265,24 @@ def frame_display():
         image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
         height, width = image.shape[:2]
         landmarks = results.hand_landmarks[0] if results.hand_landmarks else None
-        geometry = hand_geometry(landmarks, width, height) if landmarks else None
-        valid = geometry is not None and 0 <= time.monotonic() - captured_at <= MAX_FRAME_AGE
+        world = results.hand_world_landmarks[0] if results.hand_world_landmarks else None
+        direction = direction_angles(world) if world else None
+        valid = landmarks is not None and direction is not None and 0 <= time.monotonic() - captured_at <= MAX_FRAME_AGE
+
+        if landmarks is not None:
+            for connection in mp.tasks.vision.HandLandmarksConnections.HAND_CONNECTIONS:
+                start, end = landmarks[connection.start], landmarks[connection.end]
+                cv2.line(image, (int(start.x * width), int(start.y * height)),
+                         (int(end.x * width), int(end.y * height)), (0, 255, 0), 2)
+            for index, landmark in enumerate(landmarks):
+                point = (int(landmark.x * width), int(landmark.y * height))
+                cv2.circle(image, point, 3, (0, 255, 0), -1)
+                cv2.putText(image, str(index), (point[0] + 4, point[1] - 4),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 255), 1, cv2.LINE_AA)
 
         if valid:
-            b_angle, roll_angle, center, forward = geometry
-            position = to_vec(landmarks[2])
+            yaw, pitch, roll_angle = direction
+            position = to_vec(landmarks[0])
             depth = depth_estimate(landmarks)
             thumb = to_vec(landmarks[4]) - to_vec(landmarks[0])
             finger = to_vec(landmarks[8]) - to_vec(landmarks[0])
@@ -272,7 +291,7 @@ def frame_display():
             else:
                 grip = angle_between_vectors(thumb, finger)
                 valid = bool(np.isfinite(position).all() and
-                             np.isfinite([depth, grip, b_angle, roll_angle]).all())
+                             np.isfinite([depth, grip, yaw, pitch, roll_angle]).all())
 
         if valid:
             with tracking_lock:
@@ -283,26 +302,24 @@ def frame_display():
                 epoch = tracking_state["epoch"]
             if filter_epoch != epoch:
                 filtered_pos, filtered_depth, filtered_grip = position, depth, grip
+                filtered_yaw, filtered_pitch, filtered_roll = yaw, pitch, roll_angle
                 filter_epoch = epoch
             else:
                 filtered_pos = 0.9 * filtered_pos + 0.1 * position
                 filtered_depth = 0.9 * filtered_depth + 0.1 * depth
                 filtered_grip = 0.9 * filtered_grip + 0.1 * grip
+                filtered_yaw += 0.1 * angle_delta(yaw, filtered_yaw)
+                filtered_pitch += 0.1 * angle_delta(pitch, filtered_pitch)
+                filtered_roll += 0.1 * angle_delta(roll_angle, filtered_roll)
 
-            for connection in mp.tasks.vision.HandLandmarksConnections.HAND_CONNECTIONS:
-                start, end = landmarks[connection.start], landmarks[connection.end]
-                cv2.line(image, (int(start.x * width), int(start.y * height)),
-                         (int(end.x * width), int(end.y * height)), (0, 255, 0), 2)
-            for index, landmark in enumerate(landmarks):
-                point = (int(landmark.x * width), int(landmark.y * height))
-                cv2.circle(image, point, 3, (0, 255, 0), -1)
-                cv2.putText(image, str(index), (point[0] + 4, point[1] - 4),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 255), 1, cv2.LINE_AA)
-            cv2.arrowedLine(image, tuple(center.astype(int)),
-                            tuple((center + 50 * forward).astype(int)), (0, 0, 255), 2)
+            origin = np.array([landmarks[0].x * width, landmarks[0].y * height])
+            thumb_direction = np.array([(landmarks[4].x - landmarks[2].x) * width,
+                                        (landmarks[4].y - landmarks[2].y) * height])
+            cv2.arrowedLine(image, tuple(origin.astype(int)),
+                            tuple((origin + thumb_direction).astype(int)), (0, 0, 255), 2)
             action = {"epoch": epoch, "captured_at": captured_at,
                       "hand_pos": filtered_pos.copy(), "hand_depth": float(filtered_depth),
-                      "b_angle": b_angle, "roll_angle": roll_angle,
+                      "yaw": filtered_yaw, "pitch": filtered_pitch, "roll_angle": filtered_roll,
                       "gripper_angle": float(filtered_grip)}
             try:
                 action_queue.put_nowait(action)
@@ -316,8 +333,9 @@ def frame_display():
 
         with tracking_lock:
             status = tracking_state["status"]
-        cv2.putText(image, status, (10, 25), cv2.FONT_HERSHEY_SIMPLEX,
-                    0.6, (0, 255, 0) if status == "ACTIVE" else (0, 0, 255), 2)
+        label = "HAND - WAIT" if landmarks is not None and not valid else status
+        cv2.putText(image, label, (10, 25), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.6, (0, 255, 0) if label == "ACTIVE" else (0, 0, 255), 2)
         cv2.imshow("SO-101 Hand Tracking", image)
         if cv2.waitKey(5) & 0xFF == 27:
             stop_event.set()
@@ -345,7 +363,7 @@ def robot_process():
                 hold = {f"{name}.pos": reading[f"{name}.pos"] for name in names}
                 with tracking_lock:
                     if tracking_state["epoch"] == epoch and not stop_event.is_set():
-                        fixed = (hold["shoulder_pan.pos"], hold["wrist_roll.pos"])
+                        fixed = (hold["shoulder_pan.pos"], hold["wrist_flex.pos"], hold["wrist_roll.pos"])
                         if fixed_targets_in_bounds(fixed, fixed_bounds):
                             robot.send_action(hold)
                             anchor, held = None, True
@@ -366,7 +384,7 @@ def robot_process():
                     hold = {f"{name}.pos": reading[f"{name}.pos"] for name in names}
                     with tracking_lock:
                         if not tracking_state["visible"] and not stop_event.is_set():
-                            fixed = (hold["shoulder_pan.pos"], hold["wrist_roll.pos"])
+                            fixed = (hold["shoulder_pan.pos"], hold["wrist_flex.pos"], hold["wrist_roll.pos"])
                             if fixed_targets_in_bounds(fixed, fixed_bounds):
                                 robot.send_action(hold)
                                 anchor, held = None, True
@@ -394,11 +412,11 @@ def robot_process():
 
             reading = robot.get_observation()
             obs = {f"{name}.pos": reading[f"{name}.pos"] for name in names}
-            current_fixed = (obs["shoulder_pan.pos"], obs["wrist_roll.pos"])
+            current_fixed = (obs["shoulder_pan.pos"], obs["wrist_flex.pos"], obs["wrist_roll.pos"])
             if not fixed_targets_in_bounds(current_fixed, fixed_bounds):
                 with tracking_lock:
                     if tracking_state["status"] != "WAIT MOTOR LIMIT":
-                        print(f"WAIT MOTOR LIMIT: leitura M1/M5 fora da calibração: {current_fixed}; "
+                        print(f"WAIT MOTOR LIMIT: leitura M1/M4/M5 fora da calibração: {current_fixed}; "
                               "último objetivo pode permanecer ativo", flush=True)
                     tracking_state["status"] = "WAIT MOTOR LIMIT"
                 anchor, held = None, False
@@ -409,9 +427,16 @@ def robot_process():
             fresh = anchor is None or anchor["epoch"] != epoch
             if fresh:
                 proposed = {"epoch": epoch, "pos": sample["hand_pos"].copy(),
-                            "depth": sample["hand_depth"], "b": sample["b_angle"],
+                            "depth": sample["hand_depth"], "yaw": sample["yaw"], "pitch": sample["pitch"],
                             "roll": sample["roll_angle"], "grip": sample["gripper_angle"],
-                            "m1": obs["shoulder_pan.pos"], "m5": obs["wrist_roll.pos"]}
+                            "m1": obs["shoulder_pan.pos"], "m4": obs["wrist_flex.pos"], "m5": obs["wrist_roll.pos"],
+                            "joints": np.array([obs[f"{name}.pos"] for name in names]),
+                            "advance": 0.0, "last_pos": sample["hand_pos"].copy(),
+                            "last_depth": sample["hand_depth"]}
+                initial_pose = kinematics_solver.forward_kinematics(proposed["joints"])
+                initial_shoulder = kinematics_solver.robot.get_T_world_frame("shoulder_link")
+                radial_side = np.dot(initial_shoulder[:2, 0], initial_pose[:2, 3] - initial_shoulder[:2, 3])
+                proposed["radial_sign"] = 1.0 if radial_side >= 0 else -1.0
                 trial.steps[1].reset()
                 with tracking_lock:
                     valid = (tracking_state["visible"] and tracking_state["epoch"] == epoch and
@@ -429,7 +454,8 @@ def robot_process():
                 proposed = anchor.copy()
 
             targets = (
-                proposed["m1"] + angle_delta(sample["b_angle"], proposed["b"]),
+                proposed["m1"] + angle_delta(sample["yaw"], proposed["yaw"]),
+                obs["wrist_flex.pos"],
                 proposed["m5"] + angle_delta(sample["roll_angle"], proposed["roll"]),
             )
             if not fixed_targets_in_bounds(targets, fixed_bounds):
@@ -442,23 +468,48 @@ def robot_process():
                             held = True
                         anchor["grip"] = sample["gripper_angle"]
                         if tracking_state["status"] != "WAIT HAND LIMIT":
-                            print(f"WAIT HAND LIMIT: alvo M1/M5 fora da calibração: {targets}", flush=True)
+                            print(f"WAIT HAND LIMIT: alvo M1/M4/M5 fora da calibração: {targets}", flush=True)
                         tracking_state["status"] = "WAIT HAND LIMIT"
                 stop_event.wait(max(1 / FPS - (time.monotonic() - start), 0))
                 continue
             kinematics_solver.fixed_targets = targets
+            reference_joints = proposed["joints"].copy()
+            reference_joints[kinematics_solver.base_index] = targets[0]
+            rotating_reference = kinematics_solver.forward_kinematics(reference_joints)
+            shoulder = kinematics_solver.robot.get_T_world_frame("shoulder_link")
+            radial = shoulder[:2, 0].copy()
+            radial_norm = np.linalg.norm(radial)
+            if not np.isfinite(radial_norm) or radial_norm < 1e-6:
+                raise ValueError("eixo radial inválido")
+            radial *= proposed["radial_sign"] / radial_norm
+            hand_x = sample["hand_pos"][0] - proposed["last_pos"][0]
+            hand_z = sample["hand_depth"] - proposed["last_depth"]
+            yaw = np.deg2rad(sample["yaw"])
+            # shortcut: apparent size changes with pose; upgrade to measured depth when available.
+            proposed["advance"] += hand_x * np.sin(yaw) + hand_z
+            proposed["last_pos"] = sample["hand_pos"].copy()
+            proposed["last_depth"] = sample["hand_depth"]
+            desired_position = rotating_reference[:3, 3].copy()
+            desired_position[:2] += 0.5 * proposed["advance"] * radial
+            desired_position[2] += 0.5 * -(sample["hand_pos"][1] - proposed["pos"][1])
+            reference_pose = trial.steps[1].reference_ee_pose
+            if reference_pose is None or not trial.steps[1]._prev_enabled:
+                current_joints = np.array([obs[f"{name}.pos"] for name in names])
+                reference_pose = kinematics_solver.forward_kinematics(current_joints)
+            delta = (desired_position - reference_pose[:3, 3]) / 0.5
             camera_action = {
                 "enabled": True,
-                "target_x": sample["hand_pos"][0] - proposed["pos"][0],
-                "target_z": -(sample["hand_pos"][1] - proposed["pos"][1]),
-                "target_y": -(sample["hand_depth"] - proposed["depth"]),
+                "target_x": delta[0],
+                "target_y": delta[1],
+                "target_z": delta[2],
                 "target_wx": 0.0, "target_wy": 0.0, "target_wz": 0.0,
                 "gripper_vel": (sample["gripper_angle"] - proposed["grip"]) * 0.5,
             }
             try:
                 joint_action = trial((camera_action, obs))
-            except ValueError as exc:
-                if not str(exc).startswith("EE jump "):
+            except (ValueError, RuntimeError) as exc:
+                is_qp_error = str(exc).startswith("QPError: Problem: Infeasible QP")
+                if not is_qp_error and not str(exc).startswith("EE jump "):
                     raise
                 with tracking_lock:
                     valid = (tracking_state["visible"] and tracking_state["epoch"] == epoch and
@@ -468,9 +519,50 @@ def robot_process():
                             robot.send_action(obs)
                             held = True
                         anchor["grip"] = sample["gripper_angle"]
-                        if tracking_state["status"] != "WAIT MOVE LIMIT":
-                            print(f"WAIT MOVE LIMIT: {exc}", flush=True)
-                        tracking_state["status"] = "WAIT MOVE LIMIT"
+                        status = "WAIT IK" if is_qp_error else "WAIT MOVE LIMIT"
+                        if tracking_state["status"] != status:
+                            print(f"{status}: {exc}; motores={obs}; alvos M1/M4/M5={targets}", flush=True)
+                        tracking_state["status"] = status
+                stop_event.wait(max(1 / FPS - (time.monotonic() - start), 0))
+                continue
+            m4 = (proposed["m4"] - angle_delta(sample["pitch"], proposed["pitch"])
+                  - (joint_action["shoulder_lift.pos"] - proposed["joints"][names.index("shoulder_lift")])
+                  - (joint_action["elbow_flex.pos"] - proposed["joints"][names.index("elbow_flex")]))
+            urdf_low, urdf_high = np.degrees(kinematics_solver.robot.get_joint_limits("wrist_flex"))
+            if not (fixed_targets_in_bounds((targets[0], m4, targets[2]), fixed_bounds)
+                    and urdf_low <= m4 <= urdf_high):
+                with tracking_lock:
+                    valid = (tracking_state["visible"] and tracking_state["epoch"] == epoch and
+                             0 <= time.monotonic() - sample["captured_at"] <= MAX_FRAME_AGE)
+                    if valid and not stop_event.is_set():
+                        if not held:
+                            robot.send_action(obs)
+                            held = True
+                        anchor["grip"] = sample["gripper_angle"]
+                        if tracking_state["status"] != "WAIT HAND LIMIT":
+                            print(f"WAIT HAND LIMIT: alvo M4 compensado fora dos limites: {m4}", flush=True)
+                        tracking_state["status"] = "WAIT HAND LIMIT"
+                stop_event.wait(max(1 / FPS - (time.monotonic() - start), 0))
+                continue
+            joint_action["wrist_flex.pos"] = m4
+            trial.steps[4].q_curr[kinematics_solver.pitch_index] = m4
+            desired = trial.steps[2]._last_pos
+            actual = kinematics_solver.forward_kinematics(trial.steps[4].q_curr)[:3, 3]
+            if not np.isfinite(actual).all() or not np.isfinite(desired).all():
+                raise ValueError("resultado IK inválido")
+            error = float(np.linalg.norm(actual - desired))
+            if error > MAX_IK_ERROR_M:
+                with tracking_lock:
+                    valid = (tracking_state["visible"] and tracking_state["epoch"] == epoch and
+                             0 <= time.monotonic() - sample["captured_at"] <= MAX_FRAME_AGE)
+                    if valid and not stop_event.is_set():
+                        if not held:
+                            robot.send_action(obs)
+                            held = True
+                        anchor["grip"] = sample["gripper_angle"]
+                        if tracking_state["status"] != "WAIT IK":
+                            print(f"WAIT IK: erro {error:.3f}m", flush=True)
+                        tracking_state["status"] = "WAIT IK"
                 stop_event.wait(max(1 / FPS - (time.monotonic() - start), 0))
                 continue
             proposed["grip"] = sample["gripper_angle"]

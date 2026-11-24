@@ -59,7 +59,7 @@ O sistema é um protótipo experimental. Em 12/11/2026 o operador reportou que o
 | Braço seguiu a mão | Um movimento visível foi reportado pelo operador; ainda não é validação repetível. |
 | XYZ em centímetros, com escala real | Não implementado nem validado. X/Y são relativos à imagem; “Z” é variação de tamanho aparente. |
 | Gripper segue a mão | A versão atual usa mudança de ângulo 2D e consome cada amostra uma vez; ainda não foi validada no braço. |
-| Seta B, M1/M5 e pausa | Implementação nova verificada em simulação; direção, sensibilidade e pausa física ainda não foram validadas no braço. |
+| Direção da mão, M1/M4/M5 e pausa | Implementação experimental verificada em simulação; direção, sensibilidade e pausa física ainda não foram validadas no braço. |
 | Orientação 3D da palma, feedback visual ou Rerun | Não implementados nesta cadeia. |
 | Leitura serial e encerramento após falha | Não confiáveis ainda; timeout no Motor 1 e torque final desconhecido. |
 | Latência p50/p95 live | Não é medida de forma fiável pelo programa atual. Não reutilizar as métricas de versões anteriores. |
@@ -90,33 +90,25 @@ MediaPipe fornece 21 landmarks de imagem normalizados (`x`,`y` entre 0 e 1, tipi
 
 ### Posição e escala aparente
 
-- A posição segue o landmark **2** (base do polegar), não o centro da palma. A primeira deteção válida e cada retorno após pausa criam uma nova origem visual e registam as posições dos motores; não há gesto PALM.
-- `u = x₂ − x₂ inicial` e `v = y₂ − y₂ inicial`. São deslocamentos em coordenadas normalizadas de imagem, não centímetros.
+- A posição segue o landmark **0** (pulso), não o centro da palma. A primeira deteção válida e cada retorno após pausa criam uma nova origem visual e registam as posições dos motores; não há gesto PALM.
+- As mudanças de `x₀` e `y₀` são deslocamentos em coordenadas normalizadas de imagem, não centímetros.
 - A estimativa chamada `depth_estimate()` soma os comprimentos 2D das cadeias `0–1–2–3–4` e `0–5–6–7–8`. A diferença em relação à amostra inicial é usada como proxy de escala aparente.
-- Rodar ou abrir a mão também altera os comprimentos projetados. O código ignora o `z` de MediaPipe, não conhece o tamanho real da mão e não mede distância física à lente. Portanto `target_z` não é profundidade métrica.
-- Posição, escala e ângulo da garra passam por média exponencial: 90% do valor anterior + 10% da amostra atual. Os ângulos de M1/M5 não são filtrados. A média reduz tremor e acrescenta atraso.
+- Rodar ou abrir a mão também altera os comprimentos projetados; a escala não mede distância física à lente. O `z` estimado pelo MediaPipe é usado na orientação, não como profundidade medida.
+- Posição, escala, ângulo da garra e ângulos de orientação passam por média exponencial: 90% do valor anterior + 10% da amostra atual. A média reduz tremor e acrescenta atraso.
 
-O remapeamento do código para os processadores é:
-
-| Entrada | Campo enviado | Escala configurada no LeRobot | Interpretação aproximada |
-|---|---|---|---|
-| `u`, movimento horizontal | `x = u` | 0,5 m por unidade | `ΔX = +0,5 × u` |
-| `v`, movimento vertical | `z = −v` | 0,5 m por unidade | `ΔZ = −0,5 × v` |
-| variação de escala aparente | `y = −Δs` | 0,5 m por unidade | `ΔY = −0,5 × Δs` |
-
-Essas escalas convertem grandezas relativas para deslocamentos que a pipeline interpreta como metros; não tornam as medições da webcam métricas. A caixa cartesiana configurada em ±1 m e o passo máximo de 0,10 m não são um envelope mecânico comprovado. Com `raise_on_jump=True`, um salto maior que o passo pode lançar erro em vez de mover-se gradualmente até ao limite.
+O avanço combina o deslocamento horizontal do pulso projetado segundo a direção da mão com a variação de escala aparente. Aproximar a mão da câmara aumenta a escala e pede avanço mesmo com a mão de lado. O alvo é colocado no plano radial do braço, que acompanha M1; o deslocamento vertical do pulso altera a altura. O fator 0,5 produz valores interpretados pela pipeline como metros, mas não torna a medição da webcam métrica. A acumulação da escala aparente pode causar deriva. A caixa cartesiana configurada em ±1 m e o passo máximo de 0,10 m não são um envelope mecânico comprovado; um salto rejeitado coloca o controlo em espera.
 
 ### Gripper e rotação
 
 - O gripper usa o ângulo 2D entre os vetores pulso→ponta do polegar (`0→4`) e pulso→ponta do indicador (`0→8`). Envia a diferença do ângulo anterior, multiplicada por 0,5 no ciclo do robô.
 - `GripperVelocityToJoint` aplica `speed_factor=20`, soma a variação à leitura atual e limita o alvo numérico a 0–100. Isto não é uma medida direta da abertura da mão nem prova qual extremo físico abre/fecha.
-- A seta B é perpendicular à linha ajustada aos pontos 5, 9, 13 e 17; a sua variação angular em 2D comanda M1. A variação da linha 5–17 comanda M5. Estes dois sinais podem mudar juntos e não representam orientação 3D completa.
-- A IK usa `gripper_frame_link` sobre o eixo de M5 no URDF e não tenta manter a orientação anterior da garra (`orientation_weight=0`). Assim, em simulação, uma rotação isolada de M5 não deslocou o ponto nem exigiu compensação em M2–M4. Esse ponto é uma referência sobre o eixo, não necessariamente a ponta física da garra.
+- A direção 3D estimada usa o vetor do polegar `2→4`. A seta na imagem parte do ponto 0, paralela à projeção do polegar, e fica curta quando este aponta para a câmara. Os ângulos horizontal e vertical comandam M1 e M4; o ponto 5 fornece uma referência para estimar o roll de M5. Os pontos podem ser estimados incorretamente quando estão ocultos, e a referência de roll varia com a direção da mão. Sinais e precisão ainda não foram validados fisicamente.
+- A IK usa a origem de `wrist_link`, no eixo de M4, e não impõe orientação (`orientation_weight=0`). M2/M3 tentam posicionar M4. Depois da IK, o alvo de M4 compensa a variação de M2/M3 para acompanhar a inclinação pedida, sujeito aos limites da calibração e do URDF. A ponta da garra pode deslocar-se ao rodar M4; a compensação foi verificada no modelo, mas ainda precisa de teste físico.
 - Uma geometria ou vetores inválidos são tratados como ausência da mão. A perda ou imagem antiga provoca pausa e um pedido de manutenção; a primeira amostra válida após o regresso reancora, e uma amostra posterior volta a mover.
 - Um comando já em transmissão não pode ser cancelado; erros de leitura/escrita ou o pedido de manutenção não garantem paragem física.
-- `WAIT HAND LIMIT` indica alvo M1/M5 fora da calibração; `WAIT MOTOR LIMIT` indica leitura M1/M5 fora dela. `WAIT MOVE LIMIT` indica salto cartesiano rejeitado. O programa espera por uma amostra aceitável em vez de terminar por esses três motivos; erros de comunicação continuam a terminar o controlo. Em `WAIT MOTOR LIMIT` não é enviado um novo alvo fora da calibração, mas o último objetivo pode continuar ativo. Nos outros casos, a manutenção é apenas um pedido, não uma confirmação de paragem.
+- `WAIT HAND LIMIT` indica alvo M1/M4/M5 fora da calibração; `WAIT MOTOR LIMIT` indica leitura fora dela. `WAIT MOVE LIMIT` indica salto cartesiano rejeitado. `WAIT IK` indica uma solução com erro acima de 5 mm ou um QP inviável reportado pelo PlaCo; neste último caso o terminal mostra as leituras e os alvos. `HAND - WAIT` indica que uma mão foi detetada mas a amostra não é válida para controlo. O programa espera por uma amostra aceitável; erros de comunicação continuam a terminar o controlo. Em `WAIT MOTOR LIMIT` o último objetivo pode continuar ativo. Nos outros casos, a manutenção é apenas um pedido, não uma confirmação de paragem.
 
-Na retomada, a mão e as juntas são ancoradas no mesmo ciclo; a referência cartesiana é capturada pela cadeia na amostra seguinte. Não há PALM/FIST/PINCH, centroide da mão, handedness usado, landmarks world, normal 3D ou profundidade por sensor.
+Na retomada, a mão e as juntas são ancoradas no mesmo ciclo; a referência cartesiana é capturada pela cadeia na amostra seguinte. Os landmarks world são usados para estimar direção, não profundidade medida por sensor. Não há PALM/FIST/PINCH nem handedness usado.
 
 ### Funções para estudar no código
 
@@ -125,7 +117,7 @@ Na retomada, a mão e as juntas são ancoradas no mesmo ciclo; a referência car
 | `frame_capture()` | `Brosnantest/hand_camera_teleop.py` | Lê frames da webcam e gere a fila de imagem. |
 | `to_vec()` | mesmo | Extrai `x,y` normalizados de um landmark; ignora `z`. |
 | `angle_between_vectors()` | mesmo | Calcula ângulo 2D pelo produto escalar e `arccos`. |
-| `hand_geometry()` | mesmo | Calcula seta B e orientação da linha 5–17 na imagem. |
+| `direction_angles()` | mesmo | Estima a direção do polegar e os ângulos para M1/M4/M5. |
 | `depth_estimate()` | mesmo | Soma os segmentos 2D do polegar e indicador como proxy de tamanho aparente. |
 | `frame_display()` | mesmo | Corre MediaPipe, suaviza características, desenha pontos e publica amostras. |
 | `robot_process()` | mesmo | Lê o follower, remapeia os campos, executa processadores/IK e envia ações. |
@@ -139,21 +131,21 @@ O nome de registo `map_phone_action_to_robot_action` e a remoção de campos ant
 A cadeia de processadores atual, por ordem:
 
 1. **`MapCameraHandActionToRobotAction`:** adaptador de schema local, ação identidade.
-2. **`EEReferenceAndDelta`:** calcula a pose de `gripper_frame_link` pela leitura articular e fixa uma referência após cada reancoragem. Multiplica alvos pelos ganhos e soma à referência; não espera PALM.
+2. **`EEReferenceAndDelta`:** calcula a pose de `wrist_link` pela leitura articular e fixa uma referência após cada reancoragem. Multiplica alvos pelos ganhos e soma à referência; não espera PALM.
 3. **`EEBoundsAndSafety`:** limita posição à caixa configurada e rejeita passos acima de 0,10 m. O controlo aguarda uma amostra aceitável quando a proteção rejeita um salto; não é um limitador gradual.
 4. **`GripperVelocityToJoint`:** integra a velocidade angular do gripper num alvo numérico 0–100.
-5. **`InverseKinematicsEEToJoints`:** LeRobot e PlaCo resolvem M2–M4 para a posição desejada, mantendo M1 e M5 nos alvos calculados da mão. A orientação da garra não é imposta à IK. A solução usa o URDF e uma inicialização baseada nas juntas observadas. O gripper é independente da IK.
+5. **`InverseKinematicsEEToJoints`:** LeRobot e PlaCo resolvem M2/M3 para a posição desejada de M4, mantendo M1/M4/M5 nos alvos calculados da mão. A orientação da garra não é imposta à IK. Antes do envio, rejeita-se uma solução com erro de posição superior a 5 mm. O gripper é independente da IK.
 
 `SO101Follower` do LeRobot lê/escreve as posições `.pos` por Feetech. O LeRobot é dono do protocolo serial, calibração de motor e conversão. O ciclo é alvo de posição mais readback, não um PID em Python. Ao conectar, o LeRobot configura PID no servo (P=16, I=0, D=32 na versão 0.7 analisada).
 
 | Item | Papel e limite |
 |---|---|
 | Calibração LeRobot `teleArm_follower.json` | Interpretação/conversão calibrada do follower em `use_degrees=True`; não calibra webcam/mão/XYZ. A implementação `DEGREES` v0.7 analisada não faz clamp explícito a `range_min/range_max`. |
-| URDF `so101_new_calib.urdf` | Geometria, juntas, frames e limites do solver para `gripper_frame_link`; não mede o estado físico nem certifica batentes. |
+| URDF `so101_new_calib.urdf` | Geometria, juntas, frames e limites do solver; o alvo atual é `wrist_link`. Não mede o estado físico nem certifica batentes. |
 | Conversão servo e limites do solver | Camadas diferentes. O código não monta explicitamente uma interseção de limites entre calibração JSON e URDF. |
 | Readback/escrita serial | A leitura informa estado articular para o ciclo seguinte; uma escrita aceite não comprova execução física correta. |
 
-Mapeamento do hardware: Motor 1 `shoulder_pan`/base; Motor 2 `shoulder_lift`; Motor 3 `elbow_flex`; Motor 4 `wrist_flex`; Motor 5 `wrist_roll`; Motor 6 gripper. M1/M5 recebem alvos diretos e são considerados pela IK de M2–M4; M6 atua separadamente. Os limites locais do URDF para Motores 2 e 3 foram alargados num ensaio temporário; não são limites mecânicos confirmados nem devem ser interpretados como envelope seguro.
+Mapeamento do hardware: Motor 1 `shoulder_pan`/base; Motor 2 `shoulder_lift`; Motor 3 `elbow_flex`; Motor 4 `wrist_flex`; Motor 5 `wrist_roll`; Motor 6 gripper. M1/M4/M5 recebem alvos diretos e são considerados pela IK de M2/M3; M6 atua separadamente. Os limites locais do URDF para Motores 2 e 3 foram alargados num ensaio temporário; não são limites mecânicos confirmados nem devem ser interpretados como envelope seguro.
 
 ## Mapa do repositório
 
