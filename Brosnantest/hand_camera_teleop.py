@@ -109,6 +109,7 @@ hand_to_robot_joints_processor = RobotProcessorPipeline[tuple[RobotAction, Robot
             kinematics=kinematics_solver,
             motor_names=list(robot.bus.motors.keys()),
             initial_guess_current_joints=True,
+            orientation_weight=0.0,
         ),
     ],
     to_transition=robot_action_observation_to_transition,
@@ -344,23 +345,37 @@ def robot_process():
                 hold = {f"{name}.pos": reading[f"{name}.pos"] for name in names}
                 with tracking_lock:
                     if tracking_state["epoch"] == epoch and not stop_event.is_set():
-                        robot.send_action(hold)
-                        anchor, held = None, True
-                        tracking_state["status"] = "PAUSED"
-                        print("PAUSED: referência anterior invalidada", flush=True)
+                        fixed = (hold["shoulder_pan.pos"], hold["wrist_roll.pos"])
+                        if fixed_targets_in_bounds(fixed, fixed_bounds):
+                            robot.send_action(hold)
+                            anchor, held = None, True
+                            tracking_state["status"] = "PAUSED"
+                            print("PAUSED: referência anterior invalidada", flush=True)
+                        else:
+                            anchor, held = None, False
+                            tracking_state["status"] = "WAIT MOTOR LIMIT"
+                            print("WAIT MOTOR LIMIT: último objetivo pode permanecer ativo", flush=True)
                 continue
 
             if not visible:
                 with tracking_lock:
-                    tracking_state["status"] = "PAUSED"
+                    if tracking_state["status"] != "WAIT MOTOR LIMIT":
+                        tracking_state["status"] = "PAUSED"
                 if not held:
                     reading = robot.get_observation()
                     hold = {f"{name}.pos": reading[f"{name}.pos"] for name in names}
                     with tracking_lock:
                         if not tracking_state["visible"] and not stop_event.is_set():
-                            robot.send_action(hold)
-                            anchor, held = None, True
-                            print("PAUSED: mão indisponível", flush=True)
+                            fixed = (hold["shoulder_pan.pos"], hold["wrist_roll.pos"])
+                            if fixed_targets_in_bounds(fixed, fixed_bounds):
+                                robot.send_action(hold)
+                                anchor, held = None, True
+                                tracking_state["status"] = "PAUSED"
+                                print("PAUSED: mão indisponível", flush=True)
+                            else:
+                                if tracking_state["status"] != "WAIT MOTOR LIMIT":
+                                    print("WAIT MOTOR LIMIT: último objetivo pode permanecer ativo", flush=True)
+                                tracking_state["status"] = "WAIT MOTOR LIMIT"
                 else:
                     anchor = None
                 stop_event.wait(max(1 / FPS - (time.monotonic() - start), 0))
@@ -379,6 +394,16 @@ def robot_process():
 
             reading = robot.get_observation()
             obs = {f"{name}.pos": reading[f"{name}.pos"] for name in names}
+            current_fixed = (obs["shoulder_pan.pos"], obs["wrist_roll.pos"])
+            if not fixed_targets_in_bounds(current_fixed, fixed_bounds):
+                with tracking_lock:
+                    if tracking_state["status"] != "WAIT MOTOR LIMIT":
+                        print(f"WAIT MOTOR LIMIT: leitura M1/M5 fora da calibração: {current_fixed}; "
+                              "último objetivo pode permanecer ativo", flush=True)
+                    tracking_state["status"] = "WAIT MOTOR LIMIT"
+                anchor, held = None, False
+                stop_event.wait(max(1 / FPS - (time.monotonic() - start), 0))
+                continue
             trial = copy.copy(pipeline)
             trial.steps = [copy.copy(step) for step in pipeline.steps]
             fresh = anchor is None or anchor["epoch"] != epoch
@@ -407,11 +432,20 @@ def robot_process():
                 proposed["m1"] + angle_delta(sample["b_angle"], proposed["b"]),
                 proposed["m5"] + angle_delta(sample["roll_angle"], proposed["roll"]),
             )
-            current_fixed = (obs["shoulder_pan.pos"], obs["wrist_roll.pos"])
-            if not fixed_targets_in_bounds(current_fixed, fixed_bounds):
-                raise RuntimeError(f"leitura M1/M5 fora da calibração: {current_fixed}")
             if not fixed_targets_in_bounds(targets, fixed_bounds):
-                raise RuntimeError(f"alvo M1/M5 fora da calibração: {targets}")
+                with tracking_lock:
+                    valid = (tracking_state["visible"] and tracking_state["epoch"] == epoch and
+                             0 <= time.monotonic() - sample["captured_at"] <= MAX_FRAME_AGE)
+                    if valid and not stop_event.is_set():
+                        if not held:
+                            robot.send_action(obs)
+                            held = True
+                        anchor["grip"] = sample["gripper_angle"]
+                        if tracking_state["status"] != "WAIT HAND LIMIT":
+                            print(f"WAIT HAND LIMIT: alvo M1/M5 fora da calibração: {targets}", flush=True)
+                        tracking_state["status"] = "WAIT HAND LIMIT"
+                stop_event.wait(max(1 / FPS - (time.monotonic() - start), 0))
+                continue
             kinematics_solver.fixed_targets = targets
             camera_action = {
                 "enabled": True,
@@ -421,7 +455,24 @@ def robot_process():
                 "target_wx": 0.0, "target_wy": 0.0, "target_wz": 0.0,
                 "gripper_vel": (sample["gripper_angle"] - proposed["grip"]) * 0.5,
             }
-            joint_action = trial((camera_action, obs))
+            try:
+                joint_action = trial((camera_action, obs))
+            except ValueError as exc:
+                if not str(exc).startswith("EE jump "):
+                    raise
+                with tracking_lock:
+                    valid = (tracking_state["visible"] and tracking_state["epoch"] == epoch and
+                             0 <= time.monotonic() - sample["captured_at"] <= MAX_FRAME_AGE)
+                    if valid and not stop_event.is_set():
+                        if not held:
+                            robot.send_action(obs)
+                            held = True
+                        anchor["grip"] = sample["gripper_angle"]
+                        if tracking_state["status"] != "WAIT MOVE LIMIT":
+                            print(f"WAIT MOVE LIMIT: {exc}", flush=True)
+                        tracking_state["status"] = "WAIT MOVE LIMIT"
+                stop_event.wait(max(1 / FPS - (time.monotonic() - start), 0))
+                continue
             proposed["grip"] = sample["gripper_angle"]
             with tracking_lock:
                 valid = (tracking_state["visible"] and tracking_state["epoch"] == epoch and

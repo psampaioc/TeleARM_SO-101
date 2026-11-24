@@ -111,9 +111,10 @@ Essas escalas convertem grandezas relativas para deslocamentos que a pipeline in
 - O gripper usa o ângulo 2D entre os vetores pulso→ponta do polegar (`0→4`) e pulso→ponta do indicador (`0→8`). Envia a diferença do ângulo anterior, multiplicada por 0,5 no ciclo do robô.
 - `GripperVelocityToJoint` aplica `speed_factor=20`, soma a variação à leitura atual e limita o alvo numérico a 0–100. Isto não é uma medida direta da abertura da mão nem prova qual extremo físico abre/fecha.
 - A seta B é perpendicular à linha ajustada aos pontos 5, 9, 13 e 17; a sua variação angular em 2D comanda M1. A variação da linha 5–17 comanda M5. Estes dois sinais podem mudar juntos e não representam orientação 3D completa.
-- A IK ainda usa `gripper_frame_link`, cujo ponto está cerca de 7,9 mm fora do eixo de M5 no URDF. A rotação de M5 pode, por isso, levar a compensações em M2–M4; um ponto sobre o eixo ainda não foi introduzido.
+- A IK usa `gripper_frame_link` sobre o eixo de M5 no URDF e não tenta manter a orientação anterior da garra (`orientation_weight=0`). Assim, em simulação, uma rotação isolada de M5 não deslocou o ponto nem exigiu compensação em M2–M4. Esse ponto é uma referência sobre o eixo, não necessariamente a ponta física da garra.
 - Uma geometria ou vetores inválidos são tratados como ausência da mão. A perda ou imagem antiga provoca pausa e um pedido de manutenção; a primeira amostra válida após o regresso reancora, e uma amostra posterior volta a mover.
 - Um comando já em transmissão não pode ser cancelado; erros de leitura/escrita ou o pedido de manutenção não garantem paragem física.
+- `WAIT HAND LIMIT` indica alvo M1/M5 fora da calibração; `WAIT MOTOR LIMIT` indica leitura M1/M5 fora dela. `WAIT MOVE LIMIT` indica salto cartesiano rejeitado. O programa espera por uma amostra aceitável em vez de terminar por esses três motivos; erros de comunicação continuam a terminar o controlo. Em `WAIT MOTOR LIMIT` não é enviado um novo alvo fora da calibração, mas o último objetivo pode continuar ativo. Nos outros casos, a manutenção é apenas um pedido, não uma confirmação de paragem.
 
 Na retomada, a mão e as juntas são ancoradas no mesmo ciclo; a referência cartesiana é capturada pela cadeia na amostra seguinte. Não há PALM/FIST/PINCH, centroide da mão, handedness usado, landmarks world, normal 3D ou profundidade por sensor.
 
@@ -139,9 +140,9 @@ A cadeia de processadores atual, por ordem:
 
 1. **`MapCameraHandActionToRobotAction`:** adaptador de schema local, ação identidade.
 2. **`EEReferenceAndDelta`:** calcula a pose de `gripper_frame_link` pela leitura articular e fixa uma referência após cada reancoragem. Multiplica alvos pelos ganhos e soma à referência; não espera PALM.
-3. **`EEBoundsAndSafety`:** limita posição à caixa configurada e passo máximo de 0,10 m. O erro de salto pode parar a execução; não é um limitador gradual.
+3. **`EEBoundsAndSafety`:** limita posição à caixa configurada e rejeita passos acima de 0,10 m. O controlo aguarda uma amostra aceitável quando a proteção rejeita um salto; não é um limitador gradual.
 4. **`GripperVelocityToJoint`:** integra a velocidade angular do gripper num alvo numérico 0–100.
-5. **`InverseKinematicsEEToJoints`:** LeRobot e PlaCo resolvem M2–M4, mantendo M1 e M5 nos alvos calculados da mão. A solução usa o URDF e uma inicialização baseada nas juntas observadas. O gripper é independente da IK.
+5. **`InverseKinematicsEEToJoints`:** LeRobot e PlaCo resolvem M2–M4 para a posição desejada, mantendo M1 e M5 nos alvos calculados da mão. A orientação da garra não é imposta à IK. A solução usa o URDF e uma inicialização baseada nas juntas observadas. O gripper é independente da IK.
 
 `SO101Follower` do LeRobot lê/escreve as posições `.pos` por Feetech. O LeRobot é dono do protocolo serial, calibração de motor e conversão. O ciclo é alvo de posição mais readback, não um PID em Python. Ao conectar, o LeRobot configura PID no servo (P=16, I=0, D=32 na versão 0.7 analisada).
 
